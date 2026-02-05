@@ -20,8 +20,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private _eventAbortController?: AbortController;
   private _isServerStartedByExtension: boolean = false;
   private _serverHandle?: { url: string; close: () => void };
-  private _activeMessageId?: string;
-  private _activeMessageHadDelta: boolean = false;
+  private _activeAssistantMessageId?: string;
+  private _isGenerating: boolean = false;
 
   constructor(private readonly _extensionUri: vscode.Uri) {
     this._workspaceDirectory = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -227,26 +227,94 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       if (!this._view) return;
       if (!evt || typeof evt.type !== 'string') return;
 
+      if (!this._isGenerating) {
+        return;
+      }
+
+      // Surface tool activity and other non-text parts in the UI
       if (evt.type === 'message.part.updated') {
         const part = evt.properties?.part;
         const delta = evt.properties?.delta;
         if (!part || part.sessionID !== this._currentSessionId) return;
-        if (this._activeMessageId && part.messageID !== this._activeMessageId) return;
-        if (typeof delta === 'string' && delta.length > 0) {
-          this._activeMessageHadDelta = true;
-          this._view.webview.postMessage({ type: 'streamChunk', content: delta });
-        } else if (part.type === 'text' && typeof part.text === 'string' && part.text.length > 0) {
-          // Fallback: some servers may send full part text.
-          this._activeMessageHadDelta = true;
-          this._view.webview.postMessage({ type: 'streamChunk', content: part.text });
+        if (this._activeAssistantMessageId && part.messageID !== this._activeAssistantMessageId) return;
+
+        const pType = part.type;
+        if (pType === 'text') {
+          if (typeof delta === 'string' && delta.length > 0) {
+            this._view.webview.postMessage({ type: 'streamChunk', content: delta });
+          } else if (typeof part.text === 'string' && part.text.length > 0) {
+            // Fallback: some servers may send full part text.
+            this._view.webview.postMessage({ type: 'replaceStreaming', content: part.text });
+          }
+        }
+
+        if (pType === 'reasoning') {
+          if (typeof delta === 'string' && delta.length > 0) {
+            this._view.webview.postMessage({ type: 'thinkingDelta', text: delta });
+          } else {
+            this._view.webview.postMessage({ type: 'thinkingUpdate', text: part.text || '' });
+          }
+        }
+
+        if (pType === 'tool') {
+          this._view.webview.postMessage({
+            type: 'toolUpdate',
+            tool: part.tool,
+            callID: part.callID,
+            state: part.state,
+          });
+        }
+
+        if (pType === 'patch') {
+          this._view.webview.postMessage({
+            type: 'patchUpdate',
+            hash: part.hash,
+            files: part.files,
+          });
+        }
+
+        if (pType === 'step-start') {
+          this._view.webview.postMessage({
+            type: 'stepUpdate',
+            phase: 'start',
+            snapshot: part.snapshot,
+          });
+        }
+
+        if (pType === 'step-finish') {
+          this._view.webview.postMessage({
+            type: 'stepUpdate',
+            phase: 'finish',
+            reason: part.reason,
+            cost: part.cost,
+            tokens: part.tokens,
+          });
+
+          // Treat step finish as completion for the current generation.
+          this._isGenerating = false;
+          this._activeAssistantMessageId = undefined;
+          this._view.webview.postMessage({ type: 'endStreaming' });
         }
       }
 
       if (evt.type === 'session.idle') {
         const sessionID = evt.properties?.sessionID;
         if (sessionID && sessionID === this._currentSessionId) {
-          this._view.webview.postMessage({ type: 'endStreaming' });
+          // Fallback completion signal if we didn't get step-finish.
+          if (this._isGenerating) {
+            this._isGenerating = false;
+            this._activeAssistantMessageId = undefined;
+            this._view.webview.postMessage({ type: 'endStreaming' });
+          }
         }
+      }
+
+      if (evt.type === 'session.error') {
+        const sessionID = evt.properties?.sessionID;
+        if (sessionID && sessionID !== this._currentSessionId) return;
+        const err = evt.properties?.error;
+        const msg = err?.message || err?.error || (typeof err === 'string' ? err : 'Unknown session error');
+        this._view.webview.postMessage({ type: 'error', message: msg });
       }
     }, { signal: controller.signal }).catch((err) => {
       // If connection drops, allow re-creation on next health check.
@@ -342,42 +410,43 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
 
       // Kick off the prompt. Keep a non-stream fallback by reading returned text.
       // If SSE already streamed deltas, replace content to avoid duplicates.
-      try {
-        this._activeMessageHadDelta = false;
-        const messageID = `msg_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-        this._activeMessageId = messageID;
+      this._isGenerating = true;
+      this._activeAssistantMessageId = undefined;
 
-        console.log('[OpenCode] Sending prompt', {
-          sessionID: this._currentSessionId,
-          agent,
-          messageID,
-        });
+      console.log('[OpenCode] Sending prompt', {
+        sessionID: this._currentSessionId,
+        agent,
+      });
 
-        const result = await this._client.prompt(this._currentSessionId!, {
-          parts: [{ type: 'text', text }],
-          agent,
-          messageID,
-        });
+      const result = await this._client.prompt(this._currentSessionId!, {
+        parts: [{ type: 'text', text }],
+        agent,
+      });
 
-        if (result.text) {
-          if (this._activeMessageHadDelta) {
-            this._view?.webview.postMessage({ type: 'replaceStreaming', content: result.text });
-          } else {
-            this._view?.webview.postMessage({ type: 'streamChunk', content: result.text });
-          }
-        }
-      } finally {
-        this._activeMessageId = undefined;
-        this._activeMessageHadDelta = false;
-        // If we didn't get session.idle for some reason, end streaming.
-        this._view?.webview.postMessage({ type: 'endStreaming' });
+      // Bind event filtering to the actual assistant message id.
+      if (result.assistantMessageId) {
+        this._activeAssistantMessageId = result.assistantMessageId;
       }
+
+      if (result.text) {
+        this._view?.webview.postMessage({ type: 'replaceStreaming', content: result.text });
+      }
+
+      // Safety timeout: avoid permanently stuck streaming if no completion events arrive.
+      setTimeout(() => {
+        if (!this._isGenerating) return;
+        this._isGenerating = false;
+        this._activeAssistantMessageId = undefined;
+        this._view?.webview.postMessage({ type: 'endStreaming' });
+      }, 45000);
 
     } catch (error) {
       this._view?.webview.postMessage({
         type: 'error',
         message: error instanceof Error ? error.message : 'Unknown error'
       });
+      this._isGenerating = false;
+      this._activeAssistantMessageId = undefined;
     }
   }
 

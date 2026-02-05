@@ -16,6 +16,7 @@
   const welcomeMessage = document.getElementById('welcome-message');
   
   let currentStreamingElement = null;
+  let currentStreamingRoot = null;
   let isStreaming = false;
   let isConnected = false;
   let currentMode = 'build';
@@ -196,33 +197,170 @@
     messagesContainer.innerHTML = '';
   }
 
-  function addMessage(role, content, agent) {
+  function addMessage(role, content) {
     const messageEl = document.createElement('div');
     messageEl.className = `message ${role}`;
-    
-    const headerEl = document.createElement('div');
-    headerEl.className = 'message-header';
-    
-    const avatarEl = document.createElement('div');
-    avatarEl.className = `avatar ${role}`;
-    avatarEl.textContent = role === 'user' ? 'You' : (agent || 'AI');
-    
-    headerEl.appendChild(avatarEl);
-    messageEl.appendChild(headerEl);
-    
+
+    const bubbleEl = document.createElement('div');
+    bubbleEl.className = 'bubble';
+
     const contentEl = document.createElement('div');
-    contentEl.className = 'message-content';
+    contentEl.className = 'bubble-content';
     contentEl.innerHTML = formatContent(content);
-    messageEl.appendChild(contentEl);
-    
+    bubbleEl.appendChild(contentEl);
+
+    if (role === 'assistant') {
+      const eventsEl = document.createElement('div');
+      eventsEl.className = 'assistant-events';
+      bubbleEl.appendChild(eventsEl);
+      messageEl._eventsEl = eventsEl;
+    }
+
+    messageEl.appendChild(bubbleEl);
     messagesContainer.appendChild(messageEl);
     scrollToBottom();
-    
-    return contentEl;
+
+    return { messageEl, contentEl };
+  }
+
+  function getOrCreateEventsContainer(messageEl) {
+    if (!messageEl) return null;
+    if (messageEl._eventsEl) return messageEl._eventsEl;
+    const bubble = messageEl.querySelector('.bubble');
+    if (!bubble) return null;
+    const eventsEl = document.createElement('div');
+    eventsEl.className = 'assistant-events';
+    bubble.appendChild(eventsEl);
+    messageEl._eventsEl = eventsEl;
+    return eventsEl;
+  }
+
+  function ensureThinkingBlock(messageEl) {
+    const eventsEl = getOrCreateEventsContainer(messageEl);
+    if (!eventsEl) return null;
+    let details = eventsEl.querySelector('details.thinking');
+    if (!details) {
+      details = document.createElement('details');
+      details.className = 'thinking';
+      details.open = true;
+      const summary = document.createElement('summary');
+      summary.textContent = 'Thinking';
+      const body = document.createElement('div');
+      body.className = 'thinking-body';
+      details.appendChild(summary);
+      details.appendChild(body);
+      eventsEl.appendChild(details);
+    }
+    return details.querySelector('.thinking-body');
+  }
+
+  function ensureToolList(messageEl) {
+    const eventsEl = getOrCreateEventsContainer(messageEl);
+    if (!eventsEl) return null;
+    let toolList = eventsEl.querySelector('.tool-list');
+    if (!toolList) {
+      toolList = document.createElement('div');
+      toolList.className = 'tool-list';
+      eventsEl.appendChild(toolList);
+    }
+    return toolList;
+  }
+
+  function updateToolRow(messageEl, payload) {
+    const toolList = ensureToolList(messageEl);
+    if (!toolList) return;
+    const key = payload.callID || `${payload.tool || 'tool'}_${Date.now()}`;
+    let row = toolRowsByCallId.get(key);
+    if (!row) {
+      row = document.createElement('div');
+      row.className = 'tool-row';
+      row.dataset.callId = key;
+      const head = document.createElement('div');
+      head.className = 'tool-head';
+      const name = document.createElement('span');
+      name.className = 'tool-name';
+      name.textContent = payload.tool || 'tool';
+      const status = document.createElement('span');
+      status.className = 'tool-status';
+      head.appendChild(name);
+      head.appendChild(status);
+      const body = document.createElement('div');
+      body.className = 'tool-body';
+      row.appendChild(head);
+      row.appendChild(body);
+      toolList.appendChild(row);
+      toolRowsByCallId.set(key, row);
+    }
+
+    const statusEl = row.querySelector('.tool-status');
+    const bodyEl = row.querySelector('.tool-body');
+    const state = payload.state || {};
+    const st = state.status || 'pending';
+    statusEl.textContent = st;
+    row.dataset.status = st;
+
+    bodyEl.innerHTML = '';
+    if (state.title) {
+      const title = document.createElement('div');
+      title.className = 'tool-title';
+      title.textContent = state.title;
+      bodyEl.appendChild(title);
+    }
+    if (state.input && Object.keys(state.input).length > 0) {
+      const input = document.createElement('details');
+      input.className = 'tool-io';
+      const sum = document.createElement('summary');
+      sum.textContent = 'Input';
+      const pre = document.createElement('pre');
+      pre.textContent = JSON.stringify(state.input, null, 2);
+      input.appendChild(sum);
+      input.appendChild(pre);
+      bodyEl.appendChild(input);
+    }
+    if (typeof state.output === 'string' && state.output.length > 0) {
+      const out = document.createElement('details');
+      out.className = 'tool-io';
+      const sum = document.createElement('summary');
+      sum.textContent = 'Output';
+      const pre = document.createElement('pre');
+      pre.textContent = state.output;
+      out.appendChild(sum);
+      out.appendChild(pre);
+      bodyEl.appendChild(out);
+    }
+  }
+
+  function addPatchRow(messageEl, payload) {
+    const toolList = ensureToolList(messageEl);
+    if (!toolList) return;
+    const key = payload.hash || `patch_${Date.now()}`;
+    if (patchRowsByHash.has(key)) return;
+    const row = document.createElement('div');
+    row.className = 'patch-row';
+    row.dataset.hash = key;
+    const head = document.createElement('div');
+    head.className = 'patch-head';
+    head.textContent = 'Patch';
+    const pre = document.createElement('pre');
+    pre.textContent = (payload.files || []).join('\n');
+    row.appendChild(head);
+    row.appendChild(pre);
+    toolList.appendChild(row);
+    patchRowsByHash.set(key, row);
+  }
+
+  function escapeHtml(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
   }
 
   function formatContent(content) {
-    return content
+    const safe = escapeHtml(content || '');
+    return safe
       .replace(/```(\w+)?\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
       .replace(/`([^`]+)`/g, '<code>$1</code>')
       .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
@@ -270,33 +408,98 @@
         break;
         
       case 'addMessage':
-        addMessage(message.role, message.content, message.agent);
+        addMessage(message.role, message.content);
         break;
         
       case 'startStreaming':
         isStreaming = true;
-        currentStreamingElement = addMessage('assistant', '', message.agent);
+        streamingText = '';
+        thinkingText = '';
+        toolRowsByCallId = new Map();
+        patchRowsByHash = new Map();
+        const created = addMessage('assistant', '');
+        currentStreamingRoot = created.messageEl;
+        currentStreamingElement = created.contentEl;
         updateSendButtonState();
         break;
         
       case 'streamChunk':
         if (currentStreamingElement) {
-          const currentText = currentStreamingElement.textContent || '';
-          currentStreamingElement.innerHTML = formatContent(currentText + message.content);
+          streamingText += message.content || '';
+          currentStreamingElement.innerHTML = formatContent(streamingText);
           scrollToBottom();
         }
         break;
 
       case 'replaceStreaming':
         if (currentStreamingElement) {
-          currentStreamingElement.innerHTML = formatContent(message.content || '');
+          streamingText = message.content || '';
+          currentStreamingElement.innerHTML = formatContent(streamingText);
           scrollToBottom();
+        }
+        break;
+
+      case 'thinkingDelta':
+        if (currentStreamingRoot) {
+          const body = ensureThinkingBlock(currentStreamingRoot);
+          if (body) {
+            thinkingText += message.text || '';
+            body.innerHTML = formatContent(thinkingText);
+            scrollToBottom();
+          }
+        }
+        break;
+
+      case 'thinkingUpdate':
+        if (currentStreamingRoot) {
+          const body = ensureThinkingBlock(currentStreamingRoot);
+          if (body) {
+            thinkingText = message.text || '';
+            body.innerHTML = formatContent(thinkingText);
+            scrollToBottom();
+          }
+        }
+        break;
+
+      case 'toolUpdate':
+        if (currentStreamingRoot) {
+          updateToolRow(currentStreamingRoot, message);
+          scrollToBottom();
+        }
+        break;
+
+      case 'patchUpdate':
+        if (currentStreamingRoot) {
+          addPatchRow(currentStreamingRoot, message);
+          scrollToBottom();
+        }
+        break;
+
+      case 'stepUpdate':
+        if (currentStreamingRoot) {
+          const eventsEl = getOrCreateEventsContainer(currentStreamingRoot);
+          if (eventsEl) {
+            let step = eventsEl.querySelector('.step-row');
+            if (!step) {
+              step = document.createElement('div');
+              step.className = 'step-row';
+              eventsEl.appendChild(step);
+            }
+            const phase = message.phase;
+            if (phase === 'start') {
+              step.textContent = 'Step started';
+            } else {
+              const reason = message.reason ? ` (${message.reason})` : '';
+              step.textContent = `Step finished${reason}`;
+            }
+          }
         }
         break;
         
       case 'endStreaming':
         isStreaming = false;
         currentStreamingElement = null;
+        currentStreamingRoot = null;
         updateSendButtonState();
         break;
         
@@ -373,3 +576,7 @@
 
   init();
 })();
+  let streamingText = '';
+  let thinkingText = '';
+  let toolRowsByCallId = new Map();
+  let patchRowsByHash = new Map();

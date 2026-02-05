@@ -128,7 +128,7 @@ export class OpenCodeClient {
     return cfg as Config;
   }
 
-  async prompt(sessionId: string, request: PromptRequest): Promise<{ text: string; raw: any }> {
+  async prompt(sessionId: string, request: PromptRequest): Promise<{ text: string; raw: any; assistantMessageId?: string }> {
     const client = await this._getSdkClient();
     // In SDK, session.prompt() maps to POST /session/{sessionID}/message
     const result = await client.session.prompt({
@@ -145,7 +145,8 @@ export class OpenCodeClient {
       .map((p) => p.text)
       .join('');
 
-    return { text, raw: result };
+    const assistantMessageId = result?.info?.id;
+    return { text, raw: result, assistantMessageId };
   }
 
   async promptAsync(sessionId: string, request: PromptRequest): Promise<void> {
