@@ -24,7 +24,15 @@ export function activate(context: vscode.ExtensionContext) {
     chatPanelProvider.sendMessage(text);
   });
 
-  context.subscriptions.push(openChatCommand, sendMessageCommand);
+  const startServerCommand = vscode.commands.registerCommand('opencodespec.startServer', () => {
+    void chatPanelProvider.startLocalServer();
+  });
+
+  const stopServerCommand = vscode.commands.registerCommand('opencodespec.stopServer', () => {
+    void chatPanelProvider.stopLocalServer();
+  });
+
+  context.subscriptions.push(openChatCommand, sendMessageCommand, startServerCommand, stopServerCommand);
 }
 
 export function deactivate() {}

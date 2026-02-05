@@ -4,78 +4,178 @@
   // DOM Elements
   const messagesContainer = document.getElementById('messages');
   const messageInput = document.getElementById('message-input');
+  const inputWrapper = document.getElementById('input-wrapper');
   const sendBtn = document.getElementById('send-btn');
-  const agentDropdown = document.getElementById('agent-dropdown');
-  const newChatBtn = document.getElementById('new-chat-btn');
+  const stopBtn = document.getElementById('stop-btn');
+  const modeDropdown = document.getElementById('mode-dropdown');
+  const modelDropdown = document.getElementById('model-dropdown');
+  const connectionBar = document.getElementById('connection-bar');
   const connectionStatus = document.getElementById('connection-status');
+  const attachImageBtn = document.getElementById('attach-image-btn');
+  const contextIndicator = document.getElementById('context-indicator');
   const welcomeMessage = document.getElementById('welcome-message');
   
   let currentStreamingElement = null;
   let isStreaming = false;
+  let isConnected = false;
+  let currentMode = 'build';
+  let currentModel = '';
+  let currentUrl = 'http://127.0.0.1:4096';
 
   // Initialize
   function init() {
-    // Request agents list
-    vscode.postMessage({ type: 'getAgents' });
-    
-    // Check connection
-    vscode.postMessage({ type: 'healthCheck' });
-    
-    // Setup event listeners
     setupEventListeners();
-    
-    // Auto-resize textarea
     autoResizeTextarea();
+    updateSendButtonState();
+    
+    // Request initial health check
+    vscode.postMessage({ type: 'healthCheck' });
   }
 
   function setupEventListeners() {
     // Send button
     sendBtn.addEventListener('click', sendMessage);
     
+    // Stop button
+    stopBtn.addEventListener('click', stopGeneration);
+    
     // Enter key (Cmd+Enter or Ctrl+Enter)
     messageInput.addEventListener('keydown', (e) => {
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-        sendMessage();
+        e.preventDefault();
+        if (!isConnected) {
+          openConnectionDialog();
+        } else if (isStreaming) {
+          stopGeneration();
+        } else {
+          sendMessage();
+        }
       }
     });
     
-    // New chat button
-    newChatBtn.addEventListener('click', () => {
-      clearMessages();
-      vscode.postMessage({ type: 'createSession' });
+    // Input change for send button state
+    messageInput.addEventListener('input', () => {
+      updateSendButtonState();
+      autoResize();
     });
     
-    // Suggestion buttons
-    document.querySelectorAll('.suggestion').forEach(btn => {
-      btn.addEventListener('click', () => {
-        messageInput.value = btn.dataset.text;
-        messageInput.focus();
-        autoResizeTextarea();
-      });
+    // Mode selector change
+    modeDropdown.addEventListener('change', () => {
+      currentMode = modeDropdown.value;
+      vscode.postMessage({ type: 'modeChanged', mode: currentMode });
     });
+    
+    // Model selector change
+    modelDropdown.addEventListener('change', () => {
+      currentModel = modelDropdown.value;
+      vscode.postMessage({ type: 'modelChanged', model: currentModel });
+    });
+    
+    // Connection status click
+    connectionStatus.addEventListener('click', openConnectionDialog);
+    
+    // Attach image button
+    attachImageBtn.addEventListener('click', () => {
+      if (!isConnected) {
+        openConnectionDialog();
+        return;
+      }
+      vscode.postMessage({ type: 'attachImage' });
+    });
+    
+    // Context indicator click
+    contextIndicator.addEventListener('click', () => {
+      vscode.postMessage({ type: 'showContextInfo' });
+    });
+  }
+
+  function openConnectionDialog() {
+    vscode.postMessage({ type: 'openConnectionDialog' });
   }
 
   function autoResizeTextarea() {
-    messageInput.addEventListener('input', () => {
-      messageInput.style.height = 'auto';
-      messageInput.style.height = Math.min(messageInput.scrollHeight, 150) + 'px';
-    });
+    messageInput.addEventListener('input', autoResize);
+  }
+
+  function autoResize() {
+    messageInput.style.height = 'auto';
+    const maxHeight = 110;
+    const newHeight = Math.min(messageInput.scrollHeight, maxHeight);
+    messageInput.style.height = newHeight + 'px';
+  }
+
+  function updateSendButtonState() {
+    const hasText = messageInput.value.trim().length > 0;
+    
+    if (isStreaming) {
+      sendBtn.classList.add('hidden');
+      stopBtn.classList.remove('hidden');
+    } else {
+      sendBtn.classList.remove('hidden');
+      stopBtn.classList.add('hidden');
+      sendBtn.disabled = !hasText || !isConnected;
+      sendBtn.style.opacity = (hasText && isConnected) ? '1' : '0.3';
+    }
+  }
+
+  function setConnectedState(connected, url) {
+    isConnected = connected;
+    currentUrl = url || currentUrl;
+    
+    // Update connection bar
+    connectionBar.className = connected ? 'connected' : 'disconnected';
+    
+    // Update status text
+    const statusText = connectionStatus.querySelector('.status-text');
+    if (statusText) {
+      if (connected) {
+        // Extract host:port from URL
+        const urlObj = new URL(currentUrl);
+        statusText.textContent = `connected: ${urlObj.hostname}:${urlObj.port}`;
+      } else {
+        statusText.textContent = 'disconnected';
+      }
+    }
+    
+    // Enable/disable input controls
+    if (connected) {
+      messageInput.disabled = false;
+      modeDropdown.disabled = false;
+      modelDropdown.disabled = false;
+      attachImageBtn.disabled = false;
+      inputWrapper.classList.remove('disabled');
+      
+      // Request agents and models
+      vscode.postMessage({ type: 'getAgents' });
+      vscode.postMessage({ type: 'getModels' });
+    } else {
+      messageInput.disabled = true;
+      modeDropdown.disabled = true;
+      modelDropdown.disabled = true;
+      attachImageBtn.disabled = true;
+      inputWrapper.classList.add('disabled');
+    }
+    
+    updateSendButtonState();
   }
 
   function sendMessage() {
+    if (!isConnected) {
+      openConnectionDialog();
+      return;
+    }
+    
     const text = messageInput.value.trim();
     if (!text || isStreaming) return;
     
-    const agent = agentDropdown.value || undefined;
+    const agent = currentMode;
     
-    // Clear input
     messageInput.value = '';
     messageInput.style.height = 'auto';
+    updateSendButtonState();
     
-    // Hide welcome message
-    welcomeMessage.style.display = 'none';
+    hideWelcome();
     
-    // Send to extension
     vscode.postMessage({
       type: 'sendMessage',
       text,
@@ -83,9 +183,17 @@
     });
   }
 
-  function clearMessages() {
-    messagesContainer.innerHTML = '';
+  function stopGeneration() {
+    vscode.postMessage({ type: 'stopGeneration' });
+  }
+
+  function hideWelcome() {
+    welcomeMessage.style.display = 'none';
+  }
+
+  function showWelcome() {
     welcomeMessage.style.display = 'block';
+    messagesContainer.innerHTML = '';
   }
 
   function addMessage(role, content, agent) {
@@ -114,7 +222,6 @@
   }
 
   function formatContent(content) {
-    // Simple markdown formatting
     return content
       .replace(/```(\w+)?\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
       .replace(/`([^`]+)`/g, '<code>$1</code>')
@@ -124,7 +231,29 @@
   }
 
   function scrollToBottom() {
-    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    const container = document.getElementById('messages-container');
+    container.scrollTop = container.scrollHeight;
+  }
+
+  function updateContextIndicator(usedTokens, maxTokens) {
+    const percentage = Math.min((usedTokens / maxTokens) * 100, 100);
+    const circumference = 62.8;
+    const offset = circumference - (percentage / 100) * circumference;
+    
+    const fill = contextIndicator.querySelector('.context-ring-fill');
+    if (fill) {
+      fill.style.strokeDashoffset = offset;
+      
+      if (percentage > 90) {
+        fill.style.stroke = 'var(--vscode-testing-iconFailed)';
+      } else if (percentage > 75) {
+        fill.style.stroke = 'var(--vscode-editorWarning-foreground)';
+      } else {
+        fill.style.stroke = 'var(--vscode-activityBarBadge-background)';
+      }
+    }
+    
+    contextIndicator.title = `Context: ${usedTokens.toLocaleString()} / ${maxTokens.toLocaleString()} tokens (${Math.round(percentage)}%)`;
   }
 
   // Handle messages from extension
@@ -133,7 +262,11 @@
     
     switch (message.type) {
       case 'agentsList':
-        updateAgentsList(message.agents);
+        updateModeSelector(message.agents);
+        break;
+        
+      case 'modelsList':
+        updateModelSelector(message.models);
         break;
         
       case 'addMessage':
@@ -143,7 +276,7 @@
       case 'startStreaming':
         isStreaming = true;
         currentStreamingElement = addMessage('assistant', '', message.agent);
-        sendBtn.disabled = true;
+        updateSendButtonState();
         break;
         
       case 'streamChunk':
@@ -153,32 +286,55 @@
           scrollToBottom();
         }
         break;
+
+      case 'replaceStreaming':
+        if (currentStreamingElement) {
+          currentStreamingElement.innerHTML = formatContent(message.content || '');
+          scrollToBottom();
+        }
+        break;
         
       case 'endStreaming':
         isStreaming = false;
         currentStreamingElement = null;
-        sendBtn.disabled = false;
+        updateSendButtonState();
         break;
         
       case 'error':
         isStreaming = false;
-        sendBtn.disabled = false;
+        updateSendButtonState();
         addMessage('system', `Error: ${message.message}`);
         break;
         
       case 'healthStatus':
-        updateConnectionStatus(message.status);
+        setConnectedState(message.isConnected, message.url);
         break;
         
       case 'externalMessage':
+        if (!isConnected) {
+          openConnectionDialog();
+          return;
+        }
         messageInput.value = message.text;
-        sendMessage();
+        messageInput.focus();
+        updateSendButtonState();
+        autoResize();
+        break;
+        
+      case 'newChat':
+        showWelcome();
+        break;
+        
+      case 'contextUpdate':
+        updateContextIndicator(message.usedTokens, message.maxTokens);
         break;
     }
   });
 
-  function updateAgentsList(agents) {
-    agentDropdown.innerHTML = '<option value="">Auto</option>';
+  function updateModeSelector(agents) {
+    const currentValue = modeDropdown.value;
+    modeDropdown.innerHTML = '';
+    
     agents.forEach(agent => {
       const option = document.createElement('option');
       option.value = agent.id;
@@ -186,13 +342,33 @@
       if (agent.description) {
         option.title = agent.description;
       }
-      agentDropdown.appendChild(option);
+      modeDropdown.appendChild(option);
     });
+    
+    if (currentValue) {
+      modeDropdown.value = currentValue;
+      currentMode = currentValue;
+    }
   }
 
-  function updateConnectionStatus(status) {
-    connectionStatus.className = status === 'ok' ? 'connected' : 'disconnected';
-    connectionStatus.title = status === 'ok' ? 'Connected to OpenCode' : 'Disconnected from OpenCode';
+  function updateModelSelector(models) {
+    const currentValue = modelDropdown.value;
+    modelDropdown.innerHTML = '';
+    
+    models.forEach(model => {
+      const option = document.createElement('option');
+      option.value = model.id;
+      option.textContent = model.name;
+      if (model.description) {
+        option.title = model.description;
+      }
+      modelDropdown.appendChild(option);
+    });
+    
+    if (currentValue) {
+      modelDropdown.value = currentValue;
+      currentModel = currentValue;
+    }
   }
 
   init();
