@@ -36,6 +36,10 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private _pendingHistorySessionId?: string;
   private _historyReloadTimer?: ReturnType<typeof setTimeout>;
   private _hasBoundStreamingMessageId: boolean = false;
+  private _modelContextLimitById: Map<string, number> = new Map();
+  private _defaultModelContextLimit?: number;
+  private _lastContextUsedTokens?: number;
+  private _lastContextMaxTokens?: number;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -134,6 +138,17 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         sessionId: sid,
         messages,
       });
+
+      // Best-effort: update context indicator based on the last assistant message.
+      try {
+        const lastAssistant = [...(messages || [])].reverse().find((m: any) => m?.info?.role === 'assistant');
+        if (lastAssistant?.info) {
+          this._updateContextIndicatorFromMessage(lastAssistant.info);
+        }
+      } catch {
+        // noop
+      }
+
       this._hasRenderedInitialHistory = true;
       this._lastHistorySessionId = sid;
     } catch (error) {
@@ -255,9 +270,15 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
           break;
         case 'modelChanged':
           break;
-        case 'attachImage':
-          break;
         case 'showContextInfo':
+          if (typeof this._lastContextUsedTokens === 'number' && typeof this._lastContextMaxTokens === 'number') {
+            const pct = Math.min(Math.round((this._lastContextUsedTokens / this._lastContextMaxTokens) * 100), 100);
+            void vscode.window.showInformationMessage(
+              `Context window: ${this._lastContextUsedTokens.toLocaleString()} / ${this._lastContextMaxTokens.toLocaleString()} tokens (${pct}%)`
+            );
+          } else {
+            void vscode.window.showInformationMessage('Context window usage is not available yet. Send a message first.');
+          }
           break;
       }
     });
@@ -286,6 +307,10 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     this._currentSessionId = undefined;
     this._hasRenderedInitialHistory = false;
     this._lastHistorySessionId = undefined;
+    this._modelContextLimitById.clear();
+    this._defaultModelContextLimit = undefined;
+    this._lastContextUsedTokens = undefined;
+    this._lastContextMaxTokens = undefined;
     
     // Update history
     const existingIndex = this._connectionHistory.findIndex(h => h.url === url);
@@ -300,6 +325,86 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     
     // Check health with error display
     await this._handleHealthCheck(true);
+  }
+
+  private async _loadModelContextLimits() {
+    try {
+      const payload = await this._client.getConfigProviders();
+      const providers = payload?.providers;
+      if (Array.isArray(providers)) {
+        for (const provider of providers) {
+          const providerID = typeof provider?.id === 'string' ? provider.id : undefined;
+          const models = provider?.models;
+          if (!providerID || !models || typeof models !== 'object') continue;
+          for (const [modelKey, model] of Object.entries(models)) {
+            const limit = (model as any)?.limit;
+            const ctx = typeof limit?.context === 'number' ? limit.context : undefined;
+            if (typeof ctx !== 'number' || !Number.isFinite(ctx) || ctx <= 0) continue;
+
+            // Server returns a map keyed by modelID; AssistantMessage uses (providerID, modelID).
+            // Some SDK shapes also include `model.id`; set both to be resilient.
+            if (typeof modelKey === 'string' && modelKey.length > 0) {
+              this._modelContextLimitById.set(`${providerID}/${modelKey}`, ctx);
+            }
+            const modelID = typeof (model as any)?.id === 'string' ? (model as any).id : undefined;
+            if (modelID && modelID.length > 0) {
+              this._modelContextLimitById.set(`${providerID}/${modelID}`, ctx);
+            }
+          }
+        }
+      }
+
+      // Best-effort default (used when we can't identify model for a message).
+      const defaults = payload?.default;
+      if (defaults && typeof defaults === 'object') {
+        const entries = Object.entries(defaults as Record<string, unknown>)
+          .filter(([, v]) => typeof v === 'string' && (v as string).length > 0) as Array<[string, string]>;
+        // If there is exactly one default provider->model mapping, use it.
+        if (entries.length === 1) {
+          const [providerID, modelID] = entries[0];
+          const lim = this._modelContextLimitById.get(`${providerID}/${modelID}`);
+          if (typeof lim === 'number') {
+            this._defaultModelContextLimit = lim;
+          }
+        }
+      }
+    } catch {
+      // noop
+    }
+  }
+
+  private _updateContextIndicatorFromMessage(info: any) {
+    if (!this._view) return;
+    if (!info || typeof info !== 'object') return;
+    if (info.role !== 'assistant') return;
+
+    const tokens = info.tokens;
+    const input = typeof tokens?.input === 'number' ? tokens.input : undefined;
+    if (typeof input !== 'number') return;
+
+    // Best proxy for current context usage: the prompt size for the last assistant generation.
+    // OpenCode reports per-message token usage where `input` reflects the full context window
+    // consumed to generate this assistant message.
+    const usedTokens = input;
+    if (!Number.isFinite(usedTokens) || usedTokens < 0) return;
+
+    const providerID = typeof info.providerID === 'string' ? info.providerID : undefined;
+    const modelID = typeof info.modelID === 'string' ? info.modelID : undefined;
+    const maxTokens = (providerID && modelID)
+      ? this._modelContextLimitById.get(`${providerID}/${modelID}`)
+      : this._defaultModelContextLimit;
+    if (typeof maxTokens !== 'number' || !Number.isFinite(maxTokens) || maxTokens <= 0) return;
+
+    // Avoid spamming UI with identical updates.
+    if (this._lastContextUsedTokens === usedTokens && this._lastContextMaxTokens === maxTokens) return;
+    this._lastContextUsedTokens = usedTokens;
+    this._lastContextMaxTokens = maxTokens;
+
+    this._view.webview.postMessage({
+      type: 'contextUpdate',
+      usedTokens,
+      maxTokens,
+    });
   }
 
   private async _handleStartServer() {
@@ -444,6 +549,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
             this._endStreamingUI('message.updated time.completed');
           }
         }
+
+        // Update context indicator when token usage becomes available.
+        this._updateContextIndicatorFromMessage(info);
 
         // If history is already rendered, refresh it when messages change outside of our
         // current streaming bubble (e.g., CLI/web client). Keep it best-effort and
@@ -780,6 +888,10 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       
       if (this._isConnected) {
         this._ensureEventStream();
+
+        // Load provider/model limits early so history/context rendering can use it.
+        await this._loadModelContextLimits();
+
         // Restore or create a session, then load its history.
         const sessionId = await this._ensureActiveSession();
         if (!this._hasRenderedInitialHistory || this._lastHistorySessionId !== sessionId) {
@@ -792,17 +904,24 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         }
       } else {
         this._stopEventStream();
+        this._lastContextUsedTokens = undefined;
+        this._lastContextMaxTokens = undefined;
+        this._view?.webview.postMessage({ type: 'contextUpdate', usedTokens: 0, maxTokens: 1 });
       }
     } catch (error) {
       console.error(`[OpenCode] Health check failed:`, error);
       this._isConnected = false;
       this._stopEventStream();
+      this._lastContextUsedTokens = undefined;
+      this._lastContextMaxTokens = undefined;
       this._view?.webview.postMessage({
         type: 'healthStatus',
         status: 'disconnected',
         url: this._currentUrl,
         isConnected: false
       });
+
+      this._view?.webview.postMessage({ type: 'contextUpdate', usedTokens: 0, maxTokens: 1 });
       
       // Show error notification if this was a manual connection attempt
       if (showError) {
@@ -910,7 +1029,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <link href="${styleUri}" rel="stylesheet">
         <link href="${codiconsUri}" rel="stylesheet">
-        <title>OpenCode Chat</title>
+        <title>OpenCodeSpec Chat</title>
         <style>
           .icon-svg {
             width: 16px;
@@ -930,7 +1049,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
 
           <div id="messages-container">
             <div id="welcome-message" style="display: none;">
-              <h2>Welcome to OpenCode Chat</h2>
+              <h2>Welcome to OpenCodeSpec Chat</h2>
               <p>Your AI assistant powered by OpenCode</p>
             </div>
             <div id="messages"></div>
@@ -954,27 +1073,23 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
                     </select>
                     <span class="icon-svg"><svg viewBox="0 0 16 16"><path fill="currentColor" d="M3.146 5.646a.5.5 0 0 1 .708 0L8 9.793l4.146-4.147a.5.5 0 0 1 .708.708l-4.5 4.5a.5.5 0 0 1-.708 0l-4.5-4.5a.5.5 0 0 1 0-.708z"/></svg></span>
                   </div>
-                  <span class="separator">|</span>
-                  <div class="model-selector">
-                    <span class="icon-svg"><svg viewBox="0 0 16 16"><path fill="currentColor" d="M9.5 1a.5.5 0 0 1 .5.5v2a.5.5 0 0 1-.5.5h-2a.5.5 0 0 1-.5-.5v-2a.5.5 0 0 1 .5-.5h2zm-4 4a.5.5 0 0 1 .5.5v2a.5.5 0 0 1-.5.5h-2a.5.5 0 0 1-.5-.5v-2a.5.5 0 0 1 .5-.5h2zm8 0a.5.5 0 0 1 .5.5v2a.5.5 0 0 1-.5.5h-2a.5.5 0 0 1-.5-.5v-2a.5.5 0 0 1 .5-.5h2zm-4 4a.5.5 0 0 1 .5.5v2a.5.5 0 0 1-.5.5h-2a.5.5 0 0 1-.5-.5v-2a.5.5 0 0 1 .5-.5h2z"/></svg></span>
-                    <select id="model-dropdown" disabled>
-                      <option value="">Kimi K2.5</option>
-                    </select>
-                    <span class="icon-svg"><svg viewBox="0 0 16 16"><path fill="currentColor" d="M3.146 5.646a.5.5 0 0 1 .708 0L8 9.793l4.146-4.147a.5.5 0 0 1 .708.708l-4.5 4.5a.5.5 0 0 1-.708 0l-4.5-4.5a.5.5 0 0 1 0-.708z"/></svg></span>
-                  </div>
-                </div>
+                   <span class="separator">|</span>
+                   <div class="model-selector">
+                     <select id="model-dropdown" disabled>
+                       <option value="">Kimi K2.5</option>
+                     </select>
+                     <span class="icon-svg"><svg viewBox="0 0 16 16"><path fill="currentColor" d="M3.146 5.646a.5.5 0 0 1 .708 0L8 9.793l4.146-4.147a.5.5 0 0 1 .708.708l-4.5 4.5a.5.5 0 0 1-.708 0l-4.5-4.5a.5.5 0 0 1 0-.708z"/></svg></span>
+                   </div>
+                 </div>
                 <div class="input-actions">
                   <div class="context-indicator" id="context-indicator" title="Context window usage">
                     <svg viewBox="0 0 24 24" class="context-ring">
                       <circle class="context-ring-bg" cx="12" cy="12" r="10"/>
-                      <circle class="context-ring-fill" cx="12" cy="12" r="10" stroke-dasharray="62.8" stroke-dashoffset="31.4"/>
+                      <circle class="context-ring-fill" cx="12" cy="12" r="10" stroke-dasharray="62.8" stroke-dashoffset="62.8"/>
                     </svg>
                   </div>
                   <button id="new-chat-btn" class="icon-btn" title="New chat">
                     <span class="icon-svg"><svg viewBox="0 0 16 16"><path fill="currentColor" d="M8 1.5a.5.5 0 0 1 .5.5v5.5H14a.5.5 0 0 1 0 1H8.5V14a.5.5 0 0 1-1 0V8.5H2a.5.5 0 0 1 0-1h5.5V2a.5.5 0 0 1 .5-.5z"/></svg></span>
-                  </button>
-                  <button id="attach-image-btn" class="icon-btn" title="Attach image" disabled>
-                    <span class="icon-svg"><svg viewBox="0 0 16 16"><path fill="currentColor" d="M2 2a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V2zm10-1H4a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1z"/><path fill="currentColor" d="M6 5a1 1 0 1 1-2 0 1 1 0 0 1 2 0zm-2.5 1L2 11h12l-2.5-5L8 12l-2.5-4z"/></svg></span>
                   </button>
                   <button id="send-btn" class="send-btn" title="Send (Cmd+Enter)" disabled>
                     <span class="icon-svg"><svg viewBox="0 0 16 16"><path fill="currentColor" d="M6 3.5a.5.5 0 0 1 .5-.5h8a.5.5 0 0 1 .5.5v9a.5.5 0 0 1-.5.5h-8a.5.5 0 0 1-.5-.5v-2a.5.5 0 0 0-1 0v2A1.5 1.5 0 0 0 6.5 14h8a1.5 1.5 0 0 0 1.5-1.5v-9A1.5 1.5 0 0 0 14.5 2h-8A1.5 1.5 0 0 0 5 3.5v2a.5.5 0 0 0 1 0v-2z"/><path fill="currentColor" d="M11.854 8.354a.5.5 0 0 0 0-.708l-3-3a.5.5 0 1 0-.708.708L10.293 7.5H1.5a.5.5 0 0 0 0 1h8.793l-2.147 2.146a.5.5 0 0 0 .708.708l3-3z"/></svg></span>

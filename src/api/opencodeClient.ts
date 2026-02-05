@@ -33,6 +33,11 @@ export interface Config {
   model?: string;
 }
 
+export interface ConfigProvidersPayload {
+  providers: Array<any>;
+  default: Record<string, string>;
+}
+
 export interface PromptRequest {
   parts: Array<{ type: 'text'; text: string }>;
   agent?: string;
@@ -326,6 +331,12 @@ export class OpenCodeClient {
     // Both /config and /global/config exist; /config supports directory scoping.
     const cfg = await client.config.get({ directory: this.directory }, this._dataOptions());
     return cfg as Config;
+  }
+
+  async getConfigProviders(): Promise<ConfigProvidersPayload> {
+    const client = await this._getSdkClient();
+    const result = await client.config.providers({ directory: this.directory }, this._dataOptions());
+    return result as ConfigProvidersPayload;
   }
 
   async prompt(sessionId: string, request: PromptRequest): Promise<{ text: string; raw: any; assistantMessageId?: string }> {

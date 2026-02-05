@@ -11,7 +11,6 @@
   const modelDropdown = document.getElementById('model-dropdown');
   const connectionBar = document.getElementById('connection-bar');
   const connectionStatus = document.getElementById('connection-status');
-  const attachImageBtn = document.getElementById('attach-image-btn');
   const contextIndicator = document.getElementById('context-indicator');
   const newChatBtn = document.getElementById('new-chat-btn');
   const welcomeMessage = document.getElementById('welcome-message');
@@ -88,15 +87,6 @@
     // Connection status click
     connectionStatus.addEventListener('click', openConnectionDialog);
     
-    // Attach image button
-    attachImageBtn.addEventListener('click', () => {
-      if (!isConnected) {
-        openConnectionDialog();
-        return;
-      }
-      vscode.postMessage({ type: 'attachImage' });
-    });
-    
     // Context indicator click
     contextIndicator.addEventListener('click', () => {
       vscode.postMessage({ type: 'showContextInfo' });
@@ -156,7 +146,6 @@
       messageInput.disabled = false;
       modeDropdown.disabled = false;
       modelDropdown.disabled = false;
-      attachImageBtn.disabled = false;
       if (newChatBtn) newChatBtn.disabled = false;
       inputWrapper.classList.remove('disabled');
       
@@ -167,7 +156,6 @@
       messageInput.disabled = true;
       modeDropdown.disabled = true;
       modelDropdown.disabled = true;
-      attachImageBtn.disabled = true;
       if (newChatBtn) newChatBtn.disabled = true;
       inputWrapper.classList.add('disabled');
     }
@@ -510,6 +498,21 @@
   }
 
   function updateContextIndicator(usedTokens, maxTokens) {
+    const isValid = Number.isFinite(usedTokens) && Number.isFinite(maxTokens) && maxTokens > 0;
+    // The extension uses 0/1 as a placeholder for "unavailable".
+    const isUnavailable = !isValid || (usedTokens === 0 && maxTokens === 1);
+
+    if (isUnavailable) {
+      const circumference = 62.8;
+      const fill = contextIndicator.querySelector('.context-ring-fill');
+      if (fill) {
+        fill.style.strokeDashoffset = circumference;
+        fill.style.stroke = 'var(--vscode-panel-border)';
+      }
+      contextIndicator.title = 'Context: unavailable';
+      return;
+    }
+
     const percentage = Math.min((usedTokens / maxTokens) * 100, 100);
     const circumference = 62.8;
     const offset = circumference - (percentage / 100) * circumference;

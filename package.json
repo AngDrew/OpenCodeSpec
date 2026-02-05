@@ -1,6 +1,6 @@
 {
   "name": "opencode-chat",
-  "displayName": "OpenCode Chat",
+  "displayName": "OpenCodeSpec Chat",
   "description": "GitHub Copilot-like chat using OpenCode as backend",
   "version": "0.0.1",
   "engines": {
@@ -58,7 +58,7 @@
       "activitybar": [
         {
           "id": "opencodeChat",
-          "title": "OpenCode Chat",
+          "title": "OpenCodeSpec Chat",
           "icon": "$(comment-discussion)"
         }
       ]

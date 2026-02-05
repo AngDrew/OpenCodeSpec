@@ -1,4 +1,4 @@
-/* OpenCode Chat - Desktop App styling */
+/* OpenCodeSpec Chat - Desktop App styling */
 
 * {
   box-sizing: border-box;
@@ -407,6 +407,7 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  min-width: 0;
 }
 
 /* Selectors Row */
@@ -414,6 +415,9 @@ body {
   display: flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
 }
 
 .mode-selector,
@@ -422,6 +426,8 @@ body {
   align-items: center;
   gap: 4px;
   position: relative;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .mode-selector select,
@@ -436,6 +442,13 @@ body {
   outline: none;
   appearance: none;
   -webkit-appearance: none;
+  width: auto;
+  max-width: 100%;
+  min-width: 0;
+  flex: 0 1 auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .mode-selector select:hover,
@@ -452,11 +465,6 @@ body {
   pointer-events: none;
   width: 12px;
   height: 12px;
-}
-
-.model-selector .icon-svg:first-child {
-  color: var(--vscode-foreground);
-  margin-left: 4px;
 }
 
 .separator {
