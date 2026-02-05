@@ -33,6 +33,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private _isLoadingHistory: boolean = false;
   private _hasRenderedInitialHistory: boolean = false;
   private _lastHistorySessionId?: string;
+  private _pendingHistorySessionId?: string;
+  private _historyReloadTimer?: ReturnType<typeof setTimeout>;
+  private _hasBoundStreamingMessageId: boolean = false;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -118,7 +121,10 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     if (!this._isConnected) return;
     const sid = sessionId ?? this._currentSessionId;
     if (!sid) return;
-    if (this._isLoadingHistory) return;
+    if (this._isLoadingHistory) {
+      this._pendingHistorySessionId = sid;
+      return;
+    }
 
     this._isLoadingHistory = true;
     try {
@@ -135,6 +141,16 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       console.warn('[OpenCode] Failed to load session history:', msg);
     } finally {
       this._isLoadingHistory = false;
+
+      const pending = this._pendingHistorySessionId;
+      this._pendingHistorySessionId = undefined;
+      if (pending && pending !== sid && this._isConnected) {
+        // Load the latest requested session after the current one.
+        void this._loadSessionHistory(pending);
+      } else if (pending && pending === sid && this._isConnected) {
+        // If we coalesced multiple requests for the same session, run once more.
+        void this._loadSessionHistory(sid);
+      }
     }
   }
 
@@ -355,6 +371,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     this._hasReceivedTextPartUpdate = false;
     this._suppressTextPartUpdates = false;
     this._generationHasSeenBusy = false;
+    this._hasBoundStreamingMessageId = false;
     if (this._generationSafetyTimer) {
       clearTimeout(this._generationSafetyTimer);
       this._generationSafetyTimer = undefined;
@@ -413,6 +430,14 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
             this._activeAssistantMessageId = messageID;
           }
 
+          if (this._isGenerating && this._activeAssistantMessageId && !this._hasBoundStreamingMessageId) {
+            this._hasBoundStreamingMessageId = true;
+            this._view.webview.postMessage({
+              type: 'bindStreaming',
+              messageID: this._activeAssistantMessageId,
+            });
+          }
+
           const isActive = this._activeAssistantMessageId === messageID;
           const completed = info?.time?.completed;
           if (isActive && completed) {
@@ -424,7 +449,13 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         // current streaming bubble (e.g., CLI/web client). Keep it best-effort and
         // avoid spamming during active generation.
         if (!this._isGenerating && this._hasRenderedInitialHistory && this._currentSessionId) {
-          void this._loadSessionHistory(this._currentSessionId);
+          if (!this._historyReloadTimer) {
+            this._historyReloadTimer = setTimeout(() => {
+              this._historyReloadTimer = undefined;
+              if (!this._currentSessionId || !this._isConnected) return;
+              void this._loadSessionHistory(this._currentSessionId);
+            }, 300);
+          }
         }
       }
 
@@ -636,6 +667,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       this._activeAssistantMessageId = undefined;
       this._hasReceivedTextPartUpdate = false;
       this._suppressTextPartUpdates = false;
+      this._hasBoundStreamingMessageId = false;
       this._generationSeq += 1;
       const generationSeq = this._generationSeq;
       this._generationStartedAt = Date.now();
@@ -658,6 +690,13 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       // Bind event filtering to the actual assistant message id.
       if (result.assistantMessageId) {
         this._activeAssistantMessageId = result.assistantMessageId;
+        if (!this._hasBoundStreamingMessageId) {
+          this._hasBoundStreamingMessageId = true;
+          this._view?.webview.postMessage({
+            type: 'bindStreaming',
+            messageID: result.assistantMessageId,
+          });
+        }
       }
 
       // HTTP response is fallback only: if we haven't seen any text part updates
@@ -931,6 +970,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
                       <circle class="context-ring-fill" cx="12" cy="12" r="10" stroke-dasharray="62.8" stroke-dashoffset="31.4"/>
                     </svg>
                   </div>
+                  <button id="new-chat-btn" class="icon-btn" title="New chat">
+                    <span class="icon-svg"><svg viewBox="0 0 16 16"><path fill="currentColor" d="M8 1.5a.5.5 0 0 1 .5.5v5.5H14a.5.5 0 0 1 0 1H8.5V14a.5.5 0 0 1-1 0V8.5H2a.5.5 0 0 1 0-1h5.5V2a.5.5 0 0 1 .5-.5z"/></svg></span>
+                  </button>
                   <button id="attach-image-btn" class="icon-btn" title="Attach image" disabled>
                     <span class="icon-svg"><svg viewBox="0 0 16 16"><path fill="currentColor" d="M2 2a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V2zm10-1H4a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1z"/><path fill="currentColor" d="M6 5a1 1 0 1 1-2 0 1 1 0 0 1 2 0zm-2.5 1L2 11h12l-2.5-5L8 12l-2.5-4z"/></svg></span>
                   </button>

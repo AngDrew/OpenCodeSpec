@@ -13,6 +13,7 @@
   const connectionStatus = document.getElementById('connection-status');
   const attachImageBtn = document.getElementById('attach-image-btn');
   const contextIndicator = document.getElementById('context-indicator');
+  const newChatBtn = document.getElementById('new-chat-btn');
   const welcomeMessage = document.getElementById('welcome-message');
   
   let currentStreamingElement = null;
@@ -44,6 +45,13 @@
     
     // Stop button
     stopBtn.addEventListener('click', stopGeneration);
+
+    // New chat button
+    if (newChatBtn) {
+      newChatBtn.addEventListener('click', () => {
+        vscode.postMessage({ type: 'newChat' });
+      });
+    }
     
     // Enter key (Cmd+Enter or Ctrl+Enter)
     messageInput.addEventListener('keydown', (e) => {
@@ -149,6 +157,7 @@
       modeDropdown.disabled = false;
       modelDropdown.disabled = false;
       attachImageBtn.disabled = false;
+      if (newChatBtn) newChatBtn.disabled = false;
       inputWrapper.classList.remove('disabled');
       
       // Request agents and models
@@ -159,6 +168,7 @@
       modeDropdown.disabled = true;
       modelDropdown.disabled = true;
       attachImageBtn.disabled = true;
+      if (newChatBtn) newChatBtn.disabled = true;
       inputWrapper.classList.add('disabled');
     }
     
@@ -549,8 +559,32 @@
         updateSendButtonState();
         break;
 
+      case 'bindStreaming':
+        // If the assistant message already exists in history, stream into that bubble.
+        if (message && message.messageID) {
+          const bound = messageElsById.get(message.messageID);
+          if (bound) {
+            // Remove the placeholder streaming bubble if it's different.
+            if (currentStreamingRoot && currentStreamingRoot !== bound && !currentStreamingRoot.dataset.messageId) {
+              try {
+                currentStreamingRoot.remove();
+              } catch {
+                // noop
+              }
+            }
+            currentStreamingRoot = bound;
+            currentStreamingElement = getContentEl(bound);
+            streamingText = textByMessageId.get(message.messageID) || '';
+          }
+        }
+        break;
+
       case 'setHistory':
-        hideWelcome();
+        if ((message.messages || []).length === 0) {
+          showWelcome();
+        } else {
+          hideWelcome();
+        }
         resetHistoryState();
         (message.messages || []).forEach((entry) => {
           const info = entry?.info || {};
@@ -564,6 +598,20 @@
             applyPartUpdate(msgId, p, undefined);
           });
         });
+
+        // If we were streaming, re-bind the streaming bubble to the last assistant message.
+        if (isStreaming) {
+          const allIds = Array.from(messageElsById.keys());
+          const lastId = allIds[allIds.length - 1];
+          if (lastId) {
+            const bound = messageElsById.get(lastId);
+            if (bound) {
+              currentStreamingRoot = bound;
+              currentStreamingElement = getContentEl(bound);
+              streamingText = textByMessageId.get(lastId) || '';
+            }
+          }
+        }
         scrollToBottom();
         break;
 
