@@ -22,6 +22,11 @@
   let currentMode = 'build';
   let currentModel = '';
   let currentUrl = 'http://127.0.0.1:4096';
+  let messageElsById = new Map();
+  let textByMessageId = new Map();
+  let thinkingByMessageId = new Map();
+  let toolRowsByMessageId = new Map();
+  let patchRowsByMessageId = new Map();
 
   // Initialize
   function init() {
@@ -195,6 +200,127 @@
   function showWelcome() {
     welcomeMessage.style.display = 'block';
     messagesContainer.innerHTML = '';
+    messageElsById = new Map();
+    textByMessageId = new Map();
+    thinkingByMessageId = new Map();
+    toolRowsByMessageId = new Map();
+    patchRowsByMessageId = new Map();
+  }
+
+  function resetHistoryState() {
+    messagesContainer.innerHTML = '';
+    messageElsById = new Map();
+    textByMessageId = new Map();
+    thinkingByMessageId = new Map();
+    toolRowsByMessageId = new Map();
+    patchRowsByMessageId = new Map();
+  }
+
+  function getOrCreateMessageEl(messageID, role) {
+    if (!messageID) return null;
+    if (messageElsById.has(messageID)) return messageElsById.get(messageID);
+    const created = addMessage(role || 'assistant', '');
+    created.messageEl.dataset.messageId = messageID;
+    messageElsById.set(messageID, created.messageEl);
+    return created.messageEl;
+  }
+
+  function getContentEl(messageEl) {
+    if (!messageEl) return null;
+    return messageEl.querySelector('.bubble-content');
+  }
+
+  function getToolMapsForMessage(messageID) {
+    if (!toolRowsByMessageId.has(messageID)) toolRowsByMessageId.set(messageID, new Map());
+    if (!patchRowsByMessageId.has(messageID)) patchRowsByMessageId.set(messageID, new Map());
+    return {
+      toolRowsByCallId: toolRowsByMessageId.get(messageID),
+      patchRowsByHash: patchRowsByMessageId.get(messageID),
+    };
+  }
+
+  function updateToolRowForMessage(messageID, messageEl, payload) {
+    const maps = getToolMapsForMessage(messageID);
+    const prevToolMap = toolRowsByCallId;
+    toolRowsByCallId = maps.toolRowsByCallId;
+    try {
+      updateToolRow(messageEl, payload);
+    } finally {
+      toolRowsByCallId = prevToolMap;
+    }
+  }
+
+  function addPatchRowForMessage(messageID, messageEl, payload) {
+    const maps = getToolMapsForMessage(messageID);
+    const prevPatchMap = patchRowsByHash;
+    patchRowsByHash = maps.patchRowsByHash;
+    try {
+      addPatchRow(messageEl, payload);
+    } finally {
+      patchRowsByHash = prevPatchMap;
+    }
+  }
+
+  function applyPartUpdate(messageID, part, delta) {
+    if (!messageID || !part) return;
+    const role = (part.message && part.message.role) || part.role || 'assistant';
+    const messageEl = getOrCreateMessageEl(messageID, role);
+    if (!messageEl) return;
+
+    if (role === 'assistant') {
+      // ensure events container exists even if created as blank
+      getOrCreateEventsContainer(messageEl);
+    }
+
+    const pType = part.type;
+    if (pType === 'text') {
+      const prev = textByMessageId.get(messageID) || '';
+      const next = (typeof delta === 'string' && delta.length > 0) ? (prev + delta) : (part.text || prev);
+      textByMessageId.set(messageID, next);
+      const contentEl = getContentEl(messageEl);
+      if (contentEl) contentEl.innerHTML = formatContent(next);
+    }
+
+    if (pType === 'reasoning') {
+      const prev = thinkingByMessageId.get(messageID) || '';
+      const next = (typeof delta === 'string' && delta.length > 0) ? (prev + delta) : (part.text || prev);
+      thinkingByMessageId.set(messageID, next);
+      const body = ensureThinkingBlock(messageEl);
+      if (body) body.innerHTML = formatContent(next);
+    }
+
+    if (pType === 'tool') {
+      updateToolRowForMessage(messageID, messageEl, {
+        tool: part.tool,
+        callID: part.callID,
+        state: part.state,
+      });
+    }
+
+    if (pType === 'patch') {
+      addPatchRowForMessage(messageID, messageEl, {
+        hash: part.hash,
+        files: part.files,
+      });
+    }
+
+    if (pType === 'step-start' || pType === 'step-finish') {
+      const eventsEl = getOrCreateEventsContainer(messageEl);
+      if (eventsEl) {
+        let step = eventsEl.querySelector('.step-row');
+        if (!step) {
+          step = document.createElement('div');
+          step.className = 'step-row';
+          eventsEl.appendChild(step);
+        }
+        if (pType === 'step-start') {
+          step.textContent = 'Step started';
+        } else {
+          const reason = part.reason ? ` (${part.reason})` : '';
+          step.textContent = `Step finished${reason}`;
+        }
+      }
+    }
   }
 
   function addMessage(role, content) {
@@ -422,6 +548,30 @@
         currentStreamingElement = created.contentEl;
         updateSendButtonState();
         break;
+
+      case 'setHistory':
+        hideWelcome();
+        resetHistoryState();
+        (message.messages || []).forEach((entry) => {
+          const info = entry?.info || {};
+          const msgId = info.id || info.messageID;
+          const role = info.role || 'assistant';
+          if (!msgId) return;
+          const messageEl = getOrCreateMessageEl(msgId, role);
+          if (!messageEl) return;
+          const parts = Array.isArray(entry.parts) ? entry.parts : [];
+          parts.forEach((p) => {
+            applyPartUpdate(msgId, p, undefined);
+          });
+        });
+        scrollToBottom();
+        break;
+
+      case 'partUpdate':
+        hideWelcome();
+        applyPartUpdate(message.messageID, message.part, message.delta);
+        scrollToBottom();
+        break;
         
       case 'streamChunk':
         if (currentStreamingElement) {
@@ -574,9 +724,10 @@
     }
   }
 
-  init();
-})();
   let streamingText = '';
   let thinkingText = '';
   let toolRowsByCallId = new Map();
   let patchRowsByHash = new Map();
+
+  init();
+})();

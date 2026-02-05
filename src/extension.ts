@@ -5,7 +5,7 @@ export function activate(context: vscode.ExtensionContext) {
   console.log('OpenCode Chat extension is now active');
 
   // Register the chat panel provider
-  const chatPanelProvider = new ChatPanelProvider(context.extensionUri);
+  const chatPanelProvider = new ChatPanelProvider(context.extensionUri, context);
   
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(

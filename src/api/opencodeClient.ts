@@ -10,6 +10,11 @@ export interface Session {
   updatedAt: string;
 }
 
+export interface SessionMessage {
+  info: any;
+  parts: any[];
+}
+
 export interface Agent {
   id: string;
   name: string;
@@ -103,6 +108,105 @@ export class OpenCodeClient {
       title: request?.title,
     }, this._dataOptions());
     return result as Session;
+  }
+
+  async getSession(sessionId: string): Promise<Session> {
+    const client = await this._getSdkClient();
+    const opts = this._dataOptions();
+
+    const calls: Array<() => Promise<any>> = [];
+    if (client?.session?.get) {
+      calls.push(() => client.session.get({ sessionID: sessionId, directory: this.directory }, opts));
+      calls.push(() => client.session.get({ sessionID: sessionId }, opts));
+      calls.push(() => client.session.get(sessionId, opts));
+    }
+    if (client?.session?.retrieve) {
+      calls.push(() => client.session.retrieve({ sessionID: sessionId, directory: this.directory }, opts));
+      calls.push(() => client.session.retrieve({ sessionID: sessionId }, opts));
+      calls.push(() => client.session.retrieve(sessionId, opts));
+    }
+
+    let lastErr: unknown;
+    for (const fn of calls) {
+      try {
+        const raw = await fn();
+        const value = raw?.data ?? raw;
+        if (value && typeof value.id === 'string') {
+          return value as Session;
+        }
+        return raw as Session;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    throw (lastErr instanceof Error ? lastErr : new Error('Failed to get session'));
+  }
+
+  async listSessions(): Promise<Session[]> {
+    const client = await this._getSdkClient();
+    const opts = this._dataOptions();
+
+    const calls: Array<() => Promise<any>> = [];
+    if (client?.session?.list) {
+      calls.push(() => client.session.list({ directory: this.directory }, opts));
+      calls.push(() => client.session.list({ directory: this.directory }));
+      calls.push(() => client.session.list(opts));
+      calls.push(() => client.session.list());
+    }
+
+    let lastErr: unknown;
+    for (const fn of calls) {
+      try {
+        const raw = await fn();
+        const value = raw?.data ?? raw;
+        if (Array.isArray(value)) {
+          return value as Session[];
+        }
+        if (Array.isArray(raw)) {
+          return raw as Session[];
+        }
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    throw (lastErr instanceof Error ? lastErr : new Error('Failed to list sessions'));
+  }
+
+  async getSessionMessages(sessionId: string, request?: { limit?: number }): Promise<SessionMessage[]> {
+    const client = await this._getSdkClient();
+    const opts = this._dataOptions();
+
+    const calls: Array<() => Promise<any>> = [];
+    if (client?.session?.messages) {
+      calls.push(() => client.session.messages({ sessionID: sessionId, directory: this.directory, limit: request?.limit }, opts));
+      calls.push(() => client.session.messages({ sessionID: sessionId, directory: this.directory }, opts));
+      calls.push(() => client.session.messages({ sessionID: sessionId }, opts));
+      calls.push(() => client.session.messages(sessionId, opts));
+      calls.push(() => client.session.messages({ sessionID: sessionId, directory: this.directory, limit: request?.limit }));
+      calls.push(() => client.session.messages({ sessionID: sessionId, directory: this.directory }));
+      calls.push(() => client.session.messages({ sessionID: sessionId }));
+      calls.push(() => client.session.messages(sessionId));
+    }
+
+    let lastErr: unknown;
+    for (const fn of calls) {
+      try {
+        const raw = await fn();
+        const value = raw?.data ?? raw;
+        if (Array.isArray(value)) {
+          return value as SessionMessage[];
+        }
+        if (Array.isArray(raw)) {
+          return raw as SessionMessage[];
+        }
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    throw (lastErr instanceof Error ? lastErr : new Error('Failed to get session messages'));
   }
 
   async abortSession(sessionId: string): Promise<void> {

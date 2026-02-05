@@ -1,512 +1,167 @@
-# AI Chat Assistant - Implementation Plan
-
-## Overview
-Build a GitHub Copilot-like chat interface that uses OpenCode as the backend via its `serve` command and REST API. This leverages OpenCode's powerful multi-agent system, MCP support, and rich tool ecosystem while providing a modern web-based UI.
-
-## Research Summary
-
-### From `research/opencode-serve-doc.md`
-
-**OpenCode Serve Command**:
-- Starts HTTP server exposing OpenCode's functionality via REST API
-- Default: hostname `127.0.0.1`, port `4096`
-- 60+ REST endpoints across categories:
-  - **Session**: Create, delete, send prompts, get messages
-  - **Files**: List, read, git status
-  - **Find**: Text search (ripgrep), file search, LSP symbols
-  - **MCP**: Full Model Context Protocol support
-  - **Tools**: List available tools with schemas
-  - **Config**: Global and project configuration
-  - **Events**: Server-Sent Events for real-time updates
-
-**SDK Usage Patterns**:
-```javascript
-// Pattern 1: Full Server + Client
-import { createOpencode } from '@opencode-ai/sdk/v2';
-const { client, server } = await createOpencode({ port: 4096 });
-
-// Pattern 2: Connect to existing server
-import { createOpencodeClient } from '@opencode-ai/sdk/v2/client';
-const client = createOpencodeClient({ baseUrl: 'http://127.0.0.1:4096' });
-```
-
-**Key API Endpoints for Chat App**:
-- `POST /session` - Create chat session
-- `POST /session/{id}/prompt` - Send message (streaming)
-- `GET /session/{id}/messages` - Get history
-- `GET /file/list` - Browse files
-- `GET /file/read` - View file content
-- `GET /find/text` - Search code
-- `GET /app/agents` - List configured agents
-- `GET /global/event` - SSE stream
-
-### From `research/opencode-architecture.md`
-
-**OpenCode Agent System** (configured in `.opencode/opencode.jsonc`):
-```jsonc
-{
-  "agent": {
-    "build": {        // Implementation tasks
-      "model": "kimi-for-coding/k2p5"
-    },
-    "plan": {         // Planning and architecture
-      "model": "proxy/gpt-5.2-high",
-      "permission": { "edit": "deny", "bash": "ask" }
-    },
-    "explore": {      // Research (read-only)
-      "model": "proxy/gemini-3-flash-preview",
-      "permission": { "edit": "deny" }
-    }
-  }
-}
-```
-
-**Skill System**: 10+ built-in skills in `.opencode/skills/`:
-- `openspec-new-change` - Start new change
-- `openspec-apply-change` - Implement tasks
-- `openspec-explore` - Explore mode
-- `openspec-verify-change` - Verify implementation
-
-**Plugin SDK** (`@opencode-ai/plugin`):
-- Hook-based architecture
-- Hooks: `chat.message`, `tool.execute`, `permission.ask`, etc.
-- Custom tool registration
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        AI Chat Assistant System                         │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  FRONTEND              API LAYER                BACKEND                 │
-│  ┌──────────┐      ┌──────────────┐       ┌────────────────┐           │
-│  │ Next.js  │◄────►│  API Proxy   │◄─────►│ OpenCode Serve │           │
-│  │ React App│ HTTP │  (Optional)  │ HTTP  │  (Port 4096)   │           │
-│  └──────────┘      └──────────────┘       └────────────────┘           │
-│       │                                           │                     │
-│       ▼                                           ▼                     │
-│  ┌──────────┐                              ┌──────────────┐            │
-│  │  Agent   │                              │Native Agents │            │
-│  │  Router  │                              │- build       │            │
-│  │(Layer 2) │                              │- plan        │            │
-│  └──────────┘                              │- explore     │            │
-│                                            └──────────────┘            │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-## Multi-Agent Architecture
-
-### Layer 1: OpenCode Native Agents
-Pre-configured agents from user's `opencode.jsonc`:
-
-| Agent | Purpose | Model | Permissions |
-|-------|---------|-------|-------------|
-| `build` | Implementation, coding | kimi-for-coding/k2p5 | Full access |
-| `plan` | Architecture, planning | proxy/gpt-5.2-high | Read-only + ask |
-| `explore` | Research, exploration | proxy/gemini-3-flash-preview | Read-only |
-
-### Layer 2: Chat Orchestrator (Frontend)
-- Analyzes user query intent
-- Routes to appropriate agent
-- Manages conversation context
-- Handles agent switching mid-conversation
-
-### Layer 3: UI Agent (Frontend)
-- Renders streaming responses
-- Visualizes tool calls
-- Manages file previews
-- Handles UI state
-
-## Technology Stack
-
-### Frontend
-| Component | Technology |
-|-----------|------------|
-| Framework | Next.js 14 (App Router) |
-| Language | TypeScript 5+ |
-| Styling | Tailwind CSS 3.4+ |
-| UI Library | shadcn/ui |
-| State Management | Zustand |
-| Data Fetching | TanStack Query |
-| Icons | Lucide React |
-| Code Highlight | PrismJS / Shiki |
-
-### Backend Integration
-| Component | Technology |
-|-----------|------------|
-| Server | OpenCode CLI (`opencode serve`) |
-| SDK | `@opencode-ai/sdk` v2 |
-| Protocol | REST API + Server-Sent Events |
-| Default Port | 4096 |
-
-## Project Structure
-
-```
-ai-chat-assistant/
-├── apps/
-│   └── web/                         # Next.js frontend
-│       ├── src/
-│       │   ├── app/                 # App router
-│       │   │   ├── page.tsx         # Main chat page
-│       │   │   ├── layout.tsx       # Root layout
-│       │   │   └── globals.css      # Global styles
-│       │   │
-│       │   ├── components/          # React components
-│       │   │   ├── chat/            # Chat UI components
-│       │   │   │   ├── ChatPanel.tsx       # Main chat panel
-│       │   │   │   ├── MessageList.tsx     # Message rendering
-│       │   │   │   ├── MessageInput.tsx    # Input with send
-│       │   │   │   ├── CodeBlock.tsx       # Syntax highlighted code
-│       │   │   │   ├── ToolCall.tsx        # Tool execution UI
-│       │   │   │   └── AgentSelector.tsx   # Agent dropdown
-│       │   │   │
-│       │   │   ├── tools/           # Tool visualization
-│       │   │   │   ├── FileTree.tsx        # File browser
-│       │   │   │   ├── FilePreview.tsx     # File content view
-│       │   │   │   ├── DiffViewer.tsx      # Code diff
-│       │   │   │   └── SearchResults.tsx   # Search results
-│       │   │   │
-│       │   │   └── ui/              # shadcn/ui components
-│       │   │
-│       │   ├── hooks/               # Custom hooks
-│       │   │   ├── useOpencode.ts   # OpenCode client hook
-│       │   │   ├── useSession.ts    # Session management
-│       │   │   ├── useStreaming.ts  # SSE streaming
-│       │   │   └── useAgents.ts     # Agent operations
-│       │   │
-│       │   ├── lib/                 # Utilities
-│       │   │   ├── api.ts           # OpenCode API client
-│       │   │   ├── agents.ts        # Agent orchestration
-│       │   │   └── utils.ts         # Helpers
-│       │   │
-│       │   ├── stores/              # Zustand stores
-│       │   │   ├── chatStore.ts     # Chat state
-│       │   │   ├── sessionStore.ts  # Session state
-│       │   │   └── agentStore.ts    # Agent state
-│       │   │
-│       │   └── types/               # TypeScript types
-│       │       ├── opencode.ts      # OpenCode API types
-│       │       └── chat.ts          # Chat app types
-│       │
-│       ├── package.json
-│       ├── tailwind.config.ts
-│       └── next.config.js
-│
-├── packages/
-│   └── opencode-sdk/                # SDK wrapper (optional)
-│       ├── src/
-│       │   ├── client.ts
-│       │   └── types.ts
-│       └── package.json
-│
-├── package.json                     # Root monorepo config
-├── turbo.json                       # Turborepo config
-└── plan.md                          # This file
-```
-
-## Key Features
-
-### 1. Chat Interface (Copilot-Style)
-- **Floating chat panel** that can be toggled with keyboard shortcut
-- **Streaming responses** via Server-Sent Events
-- **Syntax highlighting** for code blocks (multiple languages)
-- **Message threading** with conversation history
-- **Inline code suggestions** similar to Copilot
-- **Keyboard shortcuts**: Cmd+K to open, Esc to close
-
-### 2. Multi-Agent Support
-- **Agent selector dropdown** in chat header showing all configured agents
-- **Automatic agent routing** based on query intent detection
-- **Per-agent configuration** loaded from user's `opencode.jsonc`
-- **Agent-specific context** preservation across messages
-- **Visual indicators** showing which agent is responding
-
-### 3. Tool Visualization
-- **File operations**: Show file tree browser, file previews, diffs
-- **Search results**: Display ripgrep results with context
-- **Command execution**: Terminal output rendered in chat
-- **Tool call indicators**: Visual feedback when tools are invoked
-- **LSP integration**: Symbol search and go-to-definition
-
-### 4. File Integration
-- **File tree browser** in side panel
-- **File preview** on hover or click
-- **Diff viewer** for code changes with syntax highlighting
-- **Quick navigation** to referenced files
-- **File search** with ripgrep integration
-
-### 5. MCP Support
-- **Connect MCP servers** via settings UI
-- **Tool discovery** from connected MCP servers
-- **OAuth flows** for remote MCP authentication
-- **MCP server management**: Add, remove, enable/disable
-
-## API Integration Details
-
-### Core OpenCode Endpoints
-
-```typescript
-// Session Management
-POST   /session                      // Create new session
-GET    /session/{id}                 // Get session details
-DELETE /session/{id}                 // Delete session
-POST   /session/{id}/prompt          // Send message (streaming)
-POST   /session/{id}/prompt-async    // Async message
-GET    /session/{id}/messages        // Get message history
-
-// File Operations
-GET    /file/list?path={path}        // List directory contents
-GET    /file/read?path={path}        // Read file content
-GET    /file/status                  // Get git status
-
-// Search
-GET    /find/text?q={query}          // Ripgrep search
-GET    /find/files?pattern={pat}     // File pattern search
-GET    /find/symbols?q={query}       // LSP symbol search
-
-// Tools & Agents
-GET    /tool/list                    // List available tools with schemas
-GET    /tool/ids                     // Tool identifiers
-GET    /app/agents                   // List configured agents
-GET    /app/skills                   // List available skills
-
-// Configuration
-GET    /global/config                // Get global configuration
-GET    /config                       // Get project configuration
-PUT    /config                       // Update configuration
-
-// Real-time Events
-GET    /global/event                 // Server-Sent Events stream
-```
-
-### SSE Event Handling
-
-OpenCode streams events via SSE at `GET /global/event`:
-- `message` - New message content (streaming tokens)
-- `tool_call` - Tool execution started
-- `tool_result` - Tool execution completed
-- `error` - Error occurred
-- `done` - Response complete
-
-## Data Flow
-
-### Sending a Message
-
-```
-1. User types message and presses Enter
-   ↓
-2. Frontend Agent Router analyzes intent
-   ↓
-3. Select appropriate agent (build/plan/explore)
-   ↓
-4. POST /session/{id}/prompt with agent parameter
-   ↓
-5. OpenCode processes with selected agent
-   ↓
-6. SSE stream returns tokens and tool calls
-   ↓
-7. Frontend renders streaming response
-   ↓
-8. Tool calls trigger UI updates (file tree, previews)
-```
-
-### Tool Execution Flow
-
-```
-1. Agent decides to use tool
-   ↓
-2. OpenCode executes tool via tool system
-   ↓
-3. Tool result returned to agent
-   ↓
-4. Frontend visualizes tool call in chat
-   ↓
-5. Agent continues with tool result
-   ↓
-6. Final response streamed to user
-```
-
-## Configuration
-
-### OpenCode Config (User's Existing Config)
-
-The app reads from user's existing OpenCode configuration:
-
-```jsonc
-// ~/.config/opencode/opencode.jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "agent": {
-    "build": {
-      "model": "kimi-for-coding/k2p5",
-      "permission": {
-        "edit": "allow",
-        "bash": "allow"
-      }
-    },
-    "plan": {
-      "model": "proxy/gpt-5.2-high",
-      "permission": {
-        "edit": "deny",
-        "bash": "ask"
-      }
-    },
-    "explore": {
-      "model": "proxy/gemini-3-flash-preview",
-      "permission": {
-        "edit": "deny"
-      }
-    }
-  },
-  "mcp": {
-    "my-server": {
-      "type": "local",
-      "command": ["node", "server.js"],
-      "enabled": true
-    }
-  }
-}
-```
-
-### Chat App Config
-
-```typescript
-// apps/web/src/config/chat.config.ts
-export const config = {
-  opencode: {
-    baseUrl: process.env.NEXT_PUBLIC_OPENCODE_URL || 'http://127.0.0.1:4096',
-    defaultAgent: 'build',
-    reconnectAttempts: 3,
-    reconnectDelay: 1000,
-  },
-  ui: {
-    streaming: true,
-    showToolCalls: true,
-    codeHighlightTheme: 'github-dark',
-    maxMessageHistory: 100,
-  },
-  shortcuts: {
-    toggleChat: 'cmd+k',
-    closeChat: 'esc',
-    newSession: 'cmd+n',
-  }
-};
-```
-
-## Implementation Phases
-
-### Phase 1: Foundation
-- [ ] Set up monorepo with Turborepo
-- [ ] Initialize Next.js project with shadcn/ui
-- [ ] Configure TypeScript, Tailwind, ESLint
-- [ ] Create OpenCode API client wrapper
-- [ ] Test connection to OpenCode server
-- [ ] Set up Zustand stores
-
-### Phase 2: Core Chat UI
-- [ ] Build ChatPanel component with toggle
-- [ ] Implement MessageList with streaming support
-- [ ] Create MessageInput with submit handling
-- [ ] Add SSE streaming hook (`useStreaming`)
-- [ ] Implement basic session management
-- [ ] Add keyboard shortcuts (Cmd+K, Esc)
-
-### Phase 3: Agents Integration
-- [ ] Fetch agents from `/app/agents`
-- [ ] Build AgentSelector dropdown component
-- [ ] Implement agent routing logic
-- [ ] Add agent context to messages
-- [ ] Show agent indicator in messages
-
-### Phase 4: Tool Visualization
-- [ ] Create ToolCall component for tool execution
-- [ ] Build FileTree component for file browsing
-- [ ] Implement FilePreview panel
-- [ ] Add DiffViewer for code changes
-- [ ] Create SearchResults component
-- [ ] Visualize different tool types
-
-### Phase 5: Advanced Features
-- [ ] Implement file search with `/find/text`
-- [ ] Add symbol search integration
-- [ ] Build MCP server management UI
-- [ ] Add settings/configuration panel
-- [ ] Implement conversation export
-
-### Phase 6: Polish & Optimization
-- [ ] Add error handling and retry logic
-- [ ] Implement loading states and skeletons
-- [ ] Add toast notifications
-- [ ] Optimize re-renders with React.memo
-- [ ] Add accessibility features
-- [ ] Mobile responsive design
-
-## Development Workflow
-
-### Prerequisites
-- Node.js 18+
-- OpenCode CLI installed globally (`npm install -g opencode`)
-- User's OpenCode configuration at `~/.config/opencode/opencode.jsonc`
-
-### Running Locally
-
-```bash
-# Terminal 1: Start OpenCode server
-opencode serve --port=4096
-
-# Terminal 2: Start chat app
-cd ai-chat-assistant/apps/web
-npm install
-npm run dev
-
-# Access at http://localhost:3000
-```
-
-### Environment Variables
-
-```env
-# apps/web/.env.local
-NEXT_PUBLIC_OPENCODE_URL=http://127.0.0.1:4096
-NEXT_PUBLIC_OPENCODE_PROJECT_PATH=/path/to/project
-```
-
-## Security Considerations
-
-1. **Local Only**: By default, OpenCode binds to localhost (127.0.0.1)
-2. **CORS**: Configure allowed origins in development
-3. **File Access**: Respects OpenCode's permission system from config
-4. **Command Execution**: Commands run in user's environment with their permissions
-5. **Optional Proxy**: Can add API proxy layer for additional security/auth
-
-## Benefits
-
-1. **Minimal Backend Code**: Leverages OpenCode's robust server (60+ endpoints)
-2. **Feature Complete**: Access to all OpenCode tools, agents, and MCP
-3. **User Configuration**: Uses existing `opencode.jsonc` - no duplicate config
-4. **Multi-Agent**: Built-in agent system with no additional work
-5. **Extensible**: MCP support for custom tools and integrations
-6. **Familiar UI**: Copilot-like interface users already know
-7. **Streaming**: Real-time responses via Server-Sent Events
-8. **Type Safe**: Full TypeScript support with SDK types
-
-## Open Questions
-
-1. **UI Location**: Standalone web app, VS Code webview, or both?
-2. **Authentication**: Local-only or remote access support?
-3. **Feature Priority**: Which OpenCode features to expose first?
-4. **Multi-Project**: Support multiple projects simultaneously?
-
----
-
-## Next Steps
-
-1. Review and approve this plan
-2. Answer open questions above
-3. Begin Phase 1: Foundation implementation
-4. Set up project structure and dependencies
-5. Implement OpenCode API client
-6. Build core chat UI components
+# Plan: Fix Streaming Continuity + Session/History Sync
+
+This plan implements two improvements in the VS Code extension:
+
+1) Continuous streaming doesn't stop at tool-calls.
+2) Full session/history sync with OpenCode Web + CLI on the same server/port.
+
+The root issue today is that the extension treats `step-finish` as the end of generation and also only processes SSE events while `_isGenerating` is true. OpenCode's own clients keep listening to events continuously and use session/message completion signals (not `step-finish`) to decide when a response is done.
+
+## Goals
+
+- Streaming continues through tool-call steps until the assistant message is actually complete.
+- Extension can reload and display the current session history (persisted on the OpenCode server).
+- Extension stays in sync with activity from other clients (CLI/web) for the same directory + session.
+
+## Non-goals (for this change)
+
+- Full OpenCode web UI replication (session list sidebar, multi-project browsing, sharing, etc.).
+- Implementing new tools/skills/commands beyond rendering and sync.
+- Fixing repo ESLint v9 flat-config issue (unless needed for compilation).
+
+## Current Behavior (Problems)
+
+- `src/chat/chatPanel.ts` ends streaming on `part.type === 'step-finish'`.
+  - Tool execution frequently produces an intermediate `step-finish` such as `reason: tool-calls`.
+  - The final text often arrives after that, so the extension stops early.
+- `src/chat/chatPanel.ts` ignores all events when `_isGenerating` is false.
+  - This prevents the extension from reflecting message updates from other clients.
+- No persisted `sessionID` and no history loading.
+  - The extension is effectively "ephemeral UI" rather than a stateful client.
+
+## Design Overview
+
+OpenCode server state model (relevant):
+
+- Sessions are persisted: `session -> messages -> parts`.
+- Realtime updates are broadcast via SSE events:
+  - `message.updated` (message info, includes assistant completion time)
+  - `message.part.updated` (parts and optional text delta)
+  - `session.status` (busy/idle/retry)
+  - `session.error`
+
+To behave like OpenCode web/CLI:
+
+- Always subscribe to events (not only during generation).
+- Render messages by messageID + parts by partID.
+- End "streaming" UI based on session/message completion signals:
+  - Prefer `session.status` -> `idle` for the current session.
+  - Also accept `message.updated` for assistant message with `time.completed`.
+  - Do NOT treat `step-finish` as completion.
+
+## Implementation Steps
+
+### Phase A: Continuous Streaming (Do not stop at tool-calls)
+
+1) Stop using `step-finish` as the "done" signal.
+   - In `src/chat/chatPanel.ts`, remove the block that sets `_isGenerating = false` inside the `pType === 'step-finish'` handler.
+   - Still forward `stepUpdate` to the UI (so you can see tool-call steps), but don't end.
+
+2) Track "current generation" using session/message state.
+   - Maintain:
+     - `_currentSessionId` (already)
+     - `_activeAssistantMessageId` (already, but currently set only after `prompt()` returns)
+     - `_isGenerating` (already)
+   - Update `_activeAssistantMessageId` earlier when possible:
+     - When receiving `message.updated` for the current session and role=assistant, set `_activeAssistantMessageId` if it matches the latest assistant message in response to the current user send.
+
+3) End streaming on reliable completion signals.
+   - Listen for `session.status` events:
+     - When status transitions to `busy`, consider generation started.
+     - When status transitions to `idle` for `_currentSessionId`, end the streaming UI.
+   - Also listen for `message.updated`:
+     - If it is the active assistant message and includes `time.completed`, end streaming UI.
+   - Keep `session.idle` as a fallback only (it is deprecated in OpenCode types).
+
+4) Reduce/avoid `replaceStreaming` overwrites.
+   - Today we call `prompt()` and then `replaceStreaming` with `result.text`.
+   - With correct event streaming, `result.text` becomes redundant and can overwrite partial+rich output.
+   - Plan: keep the HTTP response as a fallback only if we haven't received any text part updates after N ms.
+
+Acceptance criteria for Phase A:
+
+- A prompt that triggers tools shows `tool` updates and then continues streaming assistant text after tool completion.
+- No early cut-off after `Step finished (tool-calls)`.
+- Stop button still works (session abort), and the UI exits streaming state.
+
+### Phase B: Full Session/History Sync (Web + CLI)
+
+5) Persist session identity and reload on startup.
+   - Add extension state storage:
+     - Persist `{ url, directory, sessionId }` in `workspaceState` keyed by directory.
+   - On connect / view resolve:
+     - If a saved `sessionId` exists, validate it with `session.get`.
+     - If invalid/missing, create a new session and persist.
+
+6) Load message history for the active session.
+   - Add SDK wrappers in `src/api/opencodeClient.ts`:
+     - `getSession(sessionId)`
+     - `listSessions(...)` (optional, for future)
+     - `getSessionMessages(sessionId, { limit? })` calling `session.messages`.
+   - In `src/chat/chatPanel.ts`, add `_loadSessionHistory()`:
+     - Fetch messages+parts for the active session.
+     - Send a single webview message like `{ type: 'setHistory', sessionId, messages: [...] }`.
+
+7) Render history in the webview reliably.
+   - Update `src/webview/chat.js` to support:
+     - `setHistory`: clears existing DOM and renders messages in order.
+     - Stable DOM mapping keyed by `messageID`:
+       - So that subsequent `message.part.updated` can update the correct message.
+   - Render strategy:
+     - For each message, create the bubble once.
+     - Append/update based on parts:
+       - `text`: bubble text
+       - `reasoning`: Thinking block
+       - `tool`: tool rows
+       - `step-start`/`step-finish`: step rows
+       - `patch`: patch rows
+
+8) Keep SSE subscription alive and process events even when not generating.
+   - In `src/chat/chatPanel.ts`:
+     - Remove the early return `if (!this._isGenerating) return;`.
+     - Filter by directory/session in events:
+       - Keep the existing `part.sessionID === _currentSessionId` checks.
+     - Handle `message.updated`:
+       - When message belongs to `_currentSessionId`, update/create message in UI.
+     - Handle `message.part.updated`:
+       - Update the correct message bubble by `part.messageID` (not only the currently streaming message).
+
+9) Make cross-client sync observable.
+   - When another client (CLI/web) sends a message to the same session:
+     - The extension view updates without requiring a manual refresh.
+   - If another client uses a different session, we will not auto-switch, but the history for the current session remains consistent.
+
+10) Add "New Chat" workflow.
+   - Add a webview button or command (minimal UI):
+     - Creates a new session, persists it, clears chat, loads empty history.
+   - This matches OpenCode's session model and gives deterministic sync behavior.
+
+Acceptance criteria for Phase B:
+
+- Closing and reopening VS Code restores the previous session and shows full history.
+- Opening `http://localhost:4096` shows the same session content when you are viewing the same directory/project.
+- Actions from CLI/web in the same session appear in the extension via SSE (message updates/parts).
+
+## Notes / Known Pitfalls
+
+- Directory scoping must match between clients.
+  - CLI uses its process cwd; extension uses VS Code workspace folder.
+  - If those are different paths, sessions will not appear in the other client.
+  - Recommended UX: show the active directory in the connection/status UI (later enhancement).
+
+- Events and completion:
+  - `step-finish` is a *step boundary*, not a *message completion* boundary.
+  - Prefer `session.status` idle and/or assistant `message.updated` with `time.completed`.
+
+- Performance:
+  - When always listening to SSE, coalescing updates (like the official web app does) may become necessary later.
+  - For now, we can keep it simple and only coalesce high-frequency `text` deltas if needed.
+
+## Verification Checklist
+
+- `npm run compile` passes.
+- Manual:
+  - Prompt that triggers tool-calls continues streaming to final text.
+  - Restart VS Code: history restored.
+  - Send message from CLI into same session: extension updates.
+  - Send message from extension: web UI shows it (same directory).

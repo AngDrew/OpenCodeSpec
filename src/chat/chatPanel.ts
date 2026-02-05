@@ -9,6 +9,7 @@ interface ConnectionHistory {
 
 export class ChatPanelProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'opencode.chatView';
+  private static readonly _sessionStateKeyPrefix = 'opencodeChat.sessionState:';
   
   private _view?: vscode.WebviewView;
   private _client: OpenCodeClient;
@@ -22,11 +23,137 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private _serverHandle?: { url: string; close: () => void };
   private _activeAssistantMessageId?: string;
   private _isGenerating: boolean = false;
+  private _generationSeq: number = 0;
+  private _generationStartedAt: number = 0;
+  private _generationHasSeenBusy: boolean = false;
+  private _hasReceivedTextPartUpdate: boolean = false;
+  private _suppressTextPartUpdates: boolean = false;
+  private _generationSafetyTimer?: ReturnType<typeof setTimeout>;
+  private _isRestoringSession: boolean = false;
+  private _isLoadingHistory: boolean = false;
+  private _hasRenderedInitialHistory: boolean = false;
+  private _lastHistorySessionId?: string;
 
-  constructor(private readonly _extensionUri: vscode.Uri) {
+  constructor(
+    private readonly _extensionUri: vscode.Uri,
+    private readonly _context: vscode.ExtensionContext,
+  ) {
     this._workspaceDirectory = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     this._client = new OpenCodeClient(this._currentUrl, { directory: this._workspaceDirectory });
     this._loadConnectionHistory();
+    this._restorePersistedSessionState();
+  }
+
+  private _getSessionStateKey(): string {
+    const dir = this._workspaceDirectory || 'global';
+    return `${ChatPanelProvider._sessionStateKeyPrefix}${encodeURIComponent(dir)}`;
+  }
+
+  private _restorePersistedSessionState() {
+    try {
+      const key = this._getSessionStateKey();
+      const stored = this._context.workspaceState.get(key) as any;
+      if (!stored || typeof stored !== 'object') return;
+      if (typeof stored.url === 'string' && stored.url.length > 0) {
+        this._currentUrl = stored.url;
+      }
+      if (typeof stored.sessionId === 'string' && stored.sessionId.length > 0) {
+        this._currentSessionId = stored.sessionId;
+      }
+      // Recreate client so baseUrl reflects restored url.
+      this._client = new OpenCodeClient(this._currentUrl, { directory: this._workspaceDirectory });
+    } catch {
+      // noop
+    }
+  }
+
+  private async _persistSessionState() {
+    try {
+      const key = this._getSessionStateKey();
+      await this._context.workspaceState.update(key, {
+        url: this._currentUrl,
+        directory: this._workspaceDirectory,
+        sessionId: this._currentSessionId,
+      });
+    } catch {
+      // noop
+    }
+  }
+
+  private async _ensureActiveSession(): Promise<string> {
+    if (this._isRestoringSession) {
+      // Avoid re-entrancy; return best effort.
+      if (this._currentSessionId) return this._currentSessionId;
+    }
+
+    this._isRestoringSession = true;
+    try {
+      const candidate = this._currentSessionId;
+      if (candidate && String(candidate).startsWith('ses')) {
+        try {
+          await this._client.getSession(candidate);
+          await this._persistSessionState();
+          return candidate;
+        } catch {
+          // Invalid or missing on server; fall through to create.
+        }
+      }
+
+      const created = await this._client.createSession({ title: 'Chat Session' });
+      this._currentSessionId = created.id;
+      console.log('[OpenCode] Using session:', created.id);
+      this._view?.webview.postMessage({
+        type: 'sessionCreated',
+        sessionId: created.id,
+      });
+      await this._persistSessionState();
+      return created.id;
+    } finally {
+      this._isRestoringSession = false;
+    }
+  }
+
+  private async _loadSessionHistory(sessionId?: string) {
+    if (!this._view) return;
+    if (!this._isConnected) return;
+    const sid = sessionId ?? this._currentSessionId;
+    if (!sid) return;
+    if (this._isLoadingHistory) return;
+
+    this._isLoadingHistory = true;
+    try {
+      const messages = await this._client.getSessionMessages(sid);
+      this._view.webview.postMessage({
+        type: 'setHistory',
+        sessionId: sid,
+        messages,
+      });
+      this._hasRenderedInitialHistory = true;
+      this._lastHistorySessionId = sid;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      console.warn('[OpenCode] Failed to load session history:', msg);
+    } finally {
+      this._isLoadingHistory = false;
+    }
+  }
+
+  private async _handleNewChat() {
+    if (!this._isConnected) return;
+
+    const session = await this._client.createSession({ title: 'Chat Session' });
+    this._currentSessionId = session.id;
+    this._activeAssistantMessageId = undefined;
+    this._hasRenderedInitialHistory = false;
+    this._lastHistorySessionId = undefined;
+    await this._persistSessionState();
+
+    this._view?.webview.postMessage({
+      type: 'sessionCreated',
+      sessionId: session.id,
+    });
+
+    await this._loadSessionHistory(session.id);
   }
 
   private _loadConnectionHistory() {
@@ -67,6 +194,11 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
             return;
           }
           await this._handleSendMessage(data.text, data.agent);
+          break;
+        case 'newChat':
+          if (this._isConnected) {
+            await this._handleNewChat();
+          }
           break;
         case 'getAgents':
           if (this._isConnected) {
@@ -136,6 +268,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     this._currentUrl = url;
     this._client = new OpenCodeClient(url, { directory: this._workspaceDirectory });
     this._currentSessionId = undefined;
+    this._hasRenderedInitialHistory = false;
+    this._lastHistorySessionId = undefined;
     
     // Update history
     const existingIndex = this._connectionHistory.findIndex(h => h.url === url);
@@ -214,6 +348,24 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     this._eventAbortController = undefined;
   }
 
+  private _endStreamingUI(reason: string) {
+    if (!this._isGenerating) return;
+    this._isGenerating = false;
+    this._activeAssistantMessageId = undefined;
+    this._hasReceivedTextPartUpdate = false;
+    this._suppressTextPartUpdates = false;
+    this._generationHasSeenBusy = false;
+    if (this._generationSafetyTimer) {
+      clearTimeout(this._generationSafetyTimer);
+      this._generationSafetyTimer = undefined;
+    }
+    this._view?.webview.postMessage({ type: 'endStreaming' });
+    console.log('[OpenCode] Streaming ended', {
+      reason,
+      sessionID: this._currentSessionId,
+    });
+  }
+
   private _ensureEventStream() {
     if (!this._isConnected) return;
     if (this._eventAbortController) return;
@@ -227,8 +379,53 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       if (!this._view) return;
       if (!evt || typeof evt.type !== 'string') return;
 
-      if (!this._isGenerating) {
-        return;
+      if (evt.type === 'session.status') {
+        const sessionID = evt.properties?.sessionID;
+        if (!sessionID || sessionID !== this._currentSessionId) return;
+        const status = evt.properties?.status;
+        if (typeof status === 'string') {
+          if (status === 'busy' && this._isGenerating) {
+            this._generationHasSeenBusy = true;
+          }
+          if (status === 'idle') {
+            // Reliable completion signal once a generation actually started.
+            if (!this._isGenerating) return;
+            const elapsedMs = Date.now() - this._generationStartedAt;
+            if (this._generationHasSeenBusy || elapsedMs > 1200) {
+              this._endStreamingUI('session.status idle');
+            }
+          }
+          // Note: we intentionally do not flip UI to streaming on `busy` here,
+          // because the webview needs a `startStreaming` event to create a bubble.
+        }
+      }
+
+      if (evt.type === 'message.updated') {
+        const info = evt.properties?.info;
+        const sessionID = info?.sessionID;
+        if (!sessionID || sessionID !== this._currentSessionId) return;
+
+        const role = info?.role;
+        const messageID = info?.id;
+        if (role === 'assistant' && typeof messageID === 'string' && messageID.length > 0) {
+          if (!this._activeAssistantMessageId) {
+            // Set as early as possible so part streaming filters correctly.
+            this._activeAssistantMessageId = messageID;
+          }
+
+          const isActive = this._activeAssistantMessageId === messageID;
+          const completed = info?.time?.completed;
+          if (isActive && completed) {
+            this._endStreamingUI('message.updated time.completed');
+          }
+        }
+
+        // If history is already rendered, refresh it when messages change outside of our
+        // current streaming bubble (e.g., CLI/web client). Keep it best-effort and
+        // avoid spamming during active generation.
+        if (!this._isGenerating && this._hasRenderedInitialHistory && this._currentSessionId) {
+          void this._loadSessionHistory(this._currentSessionId);
+        }
       }
 
       // Surface tool activity and other non-text parts in the UI
@@ -236,75 +433,104 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         const part = evt.properties?.part;
         const delta = evt.properties?.delta;
         if (!part || part.sessionID !== this._currentSessionId) return;
-        if (this._activeAssistantMessageId && part.messageID !== this._activeAssistantMessageId) return;
+
+        // Route updates either to the streaming bubble (active generation) or to history bubbles.
+        if (this._isGenerating && this._activeAssistantMessageId && part.messageID !== this._activeAssistantMessageId) {
+          return;
+        }
+
+        if (!this._isGenerating) {
+          // Update the correct message bubble by messageID.
+          this._view.webview.postMessage({
+            type: 'partUpdate',
+            messageID: part.messageID,
+            part,
+            delta,
+          });
+          return;
+        }
 
         const pType = part.type;
         if (pType === 'text') {
+          if (this._isGenerating && this._suppressTextPartUpdates) {
+            return;
+          }
           if (typeof delta === 'string' && delta.length > 0) {
-            this._view.webview.postMessage({ type: 'streamChunk', content: delta });
+            if (this._isGenerating) {
+              this._hasReceivedTextPartUpdate = true;
+              this._view.webview.postMessage({ type: 'streamChunk', content: delta });
+            }
           } else if (typeof part.text === 'string' && part.text.length > 0) {
             // Fallback: some servers may send full part text.
-            this._view.webview.postMessage({ type: 'replaceStreaming', content: part.text });
+            if (this._isGenerating) {
+              this._hasReceivedTextPartUpdate = true;
+              this._view.webview.postMessage({ type: 'replaceStreaming', content: part.text });
+            }
           }
         }
 
         if (pType === 'reasoning') {
-          if (typeof delta === 'string' && delta.length > 0) {
-            this._view.webview.postMessage({ type: 'thinkingDelta', text: delta });
-          } else {
-            this._view.webview.postMessage({ type: 'thinkingUpdate', text: part.text || '' });
+          if (this._isGenerating) {
+            if (typeof delta === 'string' && delta.length > 0) {
+              this._view.webview.postMessage({ type: 'thinkingDelta', text: delta });
+            } else {
+              this._view.webview.postMessage({ type: 'thinkingUpdate', text: part.text || '' });
+            }
           }
         }
 
         if (pType === 'tool') {
-          this._view.webview.postMessage({
-            type: 'toolUpdate',
-            tool: part.tool,
-            callID: part.callID,
-            state: part.state,
-          });
+          if (this._isGenerating) {
+            this._view.webview.postMessage({
+              type: 'toolUpdate',
+              tool: part.tool,
+              callID: part.callID,
+              state: part.state,
+            });
+          }
         }
 
         if (pType === 'patch') {
-          this._view.webview.postMessage({
-            type: 'patchUpdate',
-            hash: part.hash,
-            files: part.files,
-          });
+          if (this._isGenerating) {
+            this._view.webview.postMessage({
+              type: 'patchUpdate',
+              hash: part.hash,
+              files: part.files,
+            });
+          }
         }
 
         if (pType === 'step-start') {
-          this._view.webview.postMessage({
-            type: 'stepUpdate',
-            phase: 'start',
-            snapshot: part.snapshot,
-          });
+          if (this._isGenerating) {
+            this._view.webview.postMessage({
+              type: 'stepUpdate',
+              phase: 'start',
+              snapshot: part.snapshot,
+            });
+          }
         }
 
         if (pType === 'step-finish') {
-          this._view.webview.postMessage({
-            type: 'stepUpdate',
-            phase: 'finish',
-            reason: part.reason,
-            cost: part.cost,
-            tokens: part.tokens,
-          });
-
-          // Treat step finish as completion for the current generation.
-          this._isGenerating = false;
-          this._activeAssistantMessageId = undefined;
-          this._view.webview.postMessage({ type: 'endStreaming' });
+          if (this._isGenerating) {
+            this._view.webview.postMessage({
+              type: 'stepUpdate',
+              phase: 'finish',
+              reason: part.reason,
+              cost: part.cost,
+              tokens: part.tokens,
+            });
+          }
         }
       }
 
       if (evt.type === 'session.idle') {
         const sessionID = evt.properties?.sessionID;
         if (sessionID && sessionID === this._currentSessionId) {
-          // Fallback completion signal if we didn't get step-finish.
-          if (this._isGenerating) {
-            this._isGenerating = false;
-            this._activeAssistantMessageId = undefined;
-            this._view.webview.postMessage({ type: 'endStreaming' });
+          // Deprecated completion signal (fallback only).
+          if (!this._isGenerating) return;
+          const elapsedMs = Date.now() - this._generationStartedAt;
+          if (this._generationHasSeenBusy || elapsedMs > 1200) {
+            this._endStreamingUI('session.idle (fallback)');
           }
         }
       }
@@ -315,6 +541,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         const err = evt.properties?.error;
         const msg = err?.message || err?.error || (typeof err === 'string' ? err : 'Unknown session error');
         this._view.webview.postMessage({ type: 'error', message: msg });
+        this._endStreamingUI('session.error');
       }
     }, { signal: controller.signal }).catch((err) => {
       // If connection drops, allow re-creation on next health check.
@@ -384,13 +611,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   }
 
   private async _handleSendMessage(text: string, agent?: string) {
-    if (!this._currentSessionId || !String(this._currentSessionId).startsWith('ses')) {
-      this._currentSessionId = undefined;
-      await this._handleCreateSession();
-      if (!this._currentSessionId || !String(this._currentSessionId).startsWith('ses')) {
-        throw new Error(`Failed to create OpenCode session (invalid id: ${String(this._currentSessionId)})`);
-      }
-    }
+    const sessionId = await this._ensureActiveSession();
+    this._currentSessionId = sessionId;
 
     try {
       this._view?.webview.postMessage({
@@ -412,6 +634,16 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       // If SSE already streamed deltas, replace content to avoid duplicates.
       this._isGenerating = true;
       this._activeAssistantMessageId = undefined;
+      this._hasReceivedTextPartUpdate = false;
+      this._suppressTextPartUpdates = false;
+      this._generationSeq += 1;
+      const generationSeq = this._generationSeq;
+      this._generationStartedAt = Date.now();
+      this._generationHasSeenBusy = false;
+      if (this._generationSafetyTimer) {
+        clearTimeout(this._generationSafetyTimer);
+        this._generationSafetyTimer = undefined;
+      }
 
       console.log('[OpenCode] Sending prompt', {
         sessionID: this._currentSessionId,
@@ -428,25 +660,33 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         this._activeAssistantMessageId = result.assistantMessageId;
       }
 
+      // HTTP response is fallback only: if we haven't seen any text part updates
+      // within N ms, use the returned text to avoid an empty UI.
+      const fallbackAfterMs = 1200;
+      const elapsed = Date.now() - this._generationStartedAt;
+      const delay = Math.max(fallbackAfterMs - elapsed, 0);
       if (result.text) {
-        this._view?.webview.postMessage({ type: 'replaceStreaming', content: result.text });
+        setTimeout(() => {
+          if (this._generationSeq !== generationSeq) return;
+          if (!this._isGenerating) return;
+          if (this._hasReceivedTextPartUpdate) return;
+          this._suppressTextPartUpdates = true;
+          this._hasReceivedTextPartUpdate = true;
+          this._view?.webview.postMessage({ type: 'replaceStreaming', content: result.text });
+        }, delay);
       }
 
       // Safety timeout: avoid permanently stuck streaming if no completion events arrive.
-      setTimeout(() => {
-        if (!this._isGenerating) return;
-        this._isGenerating = false;
-        this._activeAssistantMessageId = undefined;
-        this._view?.webview.postMessage({ type: 'endStreaming' });
-      }, 45000);
+      this._generationSafetyTimer = setTimeout(() => {
+        this._endStreamingUI('safety-timeout');
+      }, 300000);
 
     } catch (error) {
       this._view?.webview.postMessage({
         type: 'error',
         message: error instanceof Error ? error.message : 'Unknown error'
       });
-      this._isGenerating = false;
-      this._activeAssistantMessageId = undefined;
+      this._endStreamingUI('prompt error');
     }
   }
 
@@ -475,6 +715,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       // Server enforces session IDs starting with "ses".
       this._currentSessionId = session.id;
       console.log('[OpenCode] Created session:', session.id);
+      await this._persistSessionState();
       this._view?.webview.postMessage({
         type: 'sessionCreated',
         sessionId: session.id
@@ -500,6 +741,11 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       
       if (this._isConnected) {
         this._ensureEventStream();
+        // Restore or create a session, then load its history.
+        const sessionId = await this._ensureActiveSession();
+        if (!this._hasRenderedInitialHistory || this._lastHistorySessionId !== sessionId) {
+          await this._loadSessionHistory(sessionId);
+        }
         await this._handleGetAgents();
         await this._handleGetModels();
         if (showError) {
@@ -590,12 +836,14 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     if (this._currentSessionId) {
       if (!this._currentSessionId.startsWith('ses')) {
         console.warn('[OpenCode] Refusing to abort: invalid session id', this._currentSessionId);
-        this._view?.webview.postMessage({ type: 'endStreaming' });
+        this._endStreamingUI('abort refused (invalid session id)');
         return;
       }
+
+      // End UI streaming immediately; abort is best-effort.
+      this._endStreamingUI('user stop');
       try {
         await this._client.abortSession(this._currentSessionId);
-        this._view?.webview.postMessage({ type: 'endStreaming' });
       } catch (error) {
         console.error('Failed to abort session:', error);
       }
