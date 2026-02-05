@@ -1,13 +1,30 @@
 import * as vscode from 'vscode';
+import { ChatPanelProvider } from './chat/chatPanel';
 
 export function activate(context: vscode.ExtensionContext) {
-  console.log('OpenCodeSpec extension is now active');
+  console.log('OpenCode Chat extension is now active');
 
-  const disposable = vscode.commands.registerCommand('opencodespec.helloWorld', () => {
-    vscode.window.showInformationMessage('Hello World from OpenCodeSpec!');
+  // Register the chat panel provider
+  const chatPanelProvider = new ChatPanelProvider(context.extensionUri);
+  
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(
+      ChatPanelProvider.viewType,
+      chatPanelProvider
+    )
+  );
+
+  // Register command to open chat
+  const openChatCommand = vscode.commands.registerCommand('opencodespec.openChat', () => {
+    vscode.commands.executeCommand('workbench.view.extension.opencodeChat');
   });
 
-  context.subscriptions.push(disposable);
+  // Register command to send message to chat
+  const sendMessageCommand = vscode.commands.registerCommand('opencodespec.sendMessage', (text: string) => {
+    chatPanelProvider.sendMessage(text);
+  });
+
+  context.subscriptions.push(openChatCommand, sendMessageCommand);
 }
 
 export function deactivate() {}

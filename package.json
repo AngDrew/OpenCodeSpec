@@ -1,23 +1,68 @@
 {
-  "name": "opencodespec",
-  "displayName": "OpenCodeSpec",
-  "description": "OpenCodeSpec VS Code Extension",
+  "name": "opencode-chat",
+  "displayName": "OpenCode Chat",
+  "description": "GitHub Copilot-like chat using OpenCode as backend",
   "version": "0.0.1",
   "engines": {
     "vscode": "^1.80.0"
   },
   "categories": [
-    "Other"
+    "Machine Learning",
+    "Chat"
   ],
-  "activationEvents": [],
+  "keywords": [
+    "ai",
+    "chat",
+    "copilot",
+    "opencode"
+  ],
+  "activationEvents": [
+    "onView:opencode.chatView"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
       {
+        "command": "opencodespec.openChat",
+        "title": "Open Chat",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "opencodespec.sendMessage",
+        "title": "Send Message to Chat"
+      },
+      {
         "command": "opencodespec.helloWorld",
         "title": "Hello World"
       }
-    ]
+    ],
+    "views": {
+      "opencodeChat": [
+        {
+          "type": "webview",
+          "id": "opencode.chatView",
+          "name": "Chat",
+          "when": "true"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "opencodeChat",
+          "title": "OpenCode Chat",
+          "icon": "$(comment-discussion)"
+        }
+      ]
+    },
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "opencodespec.sendMessage",
+          "when": "false"
+        }
+      ]
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
