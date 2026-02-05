@@ -90,15 +90,111 @@ export class OpenCodeClient {
 
   async health(): Promise<{ healthy: boolean; version: string }> {
     const client = await this._getSdkClient();
+
+    const parse = (raw: any): { healthy: boolean; version: string } | undefined => {
+      const value = raw?.data ?? raw;
+      if (!value) return undefined;
+
+      if (typeof value.healthy === 'boolean') {
+        return {
+          healthy: value.healthy,
+          version: typeof value.version === 'string' ? value.version : '',
+        };
+      }
+
+      // Legacy/alternate shapes we've seen in the wild.
+      if (typeof value.ok === 'boolean') {
+        return {
+          healthy: value.ok,
+          version: typeof value.version === 'string' ? value.version : '',
+        };
+      }
+      if (typeof value.status === 'string') {
+        const status = value.status.toLowerCase();
+        if (status === 'ok' || status === 'healthy') {
+          return { healthy: true, version: typeof value.version === 'string' ? value.version : '' };
+        }
+        if (status === 'error' || status === 'unhealthy') {
+          return { healthy: false, version: typeof value.version === 'string' ? value.version : '' };
+        }
+      }
+
+      return undefined;
+    };
+
+    const tryFallback = async (): Promise<{ healthy: boolean; version: string } | undefined> => {
+      const fetchImpl = (globalThis as any)?.fetch as undefined | ((...args: any[]) => Promise<any>);
+      if (typeof fetchImpl !== 'function') return undefined;
+
+      const headers: Record<string, string> = {};
+      if (this.directory) {
+        const isNonASCII = /[^\x00-\x7F]/.test(this.directory);
+        const encodedDirectory = isNonASCII ? encodeURIComponent(this.directory) : this.directory;
+        headers['x-opencode-directory'] = encodedDirectory;
+      }
+
+      const candidates = ['/health', '/global/health'];
+      for (const path of candidates) {
+        let url: URL;
+        try {
+          url = new URL(path, this.baseUrl);
+        } catch {
+          continue;
+        }
+
+        try {
+          const res = await fetchImpl(url.toString(), {
+            method: 'GET',
+            headers: Object.keys(headers).length ? headers : undefined,
+          });
+
+          if (!res?.ok) continue;
+
+          const text = typeof res.text === 'function' ? await res.text() : '';
+          if (!text) {
+            // If endpoint exists and returns 200 with an empty body, treat as reachable.
+            return { healthy: true, version: '' };
+          }
+
+          let json: any;
+          try {
+            json = JSON.parse(text);
+          } catch {
+            json = text;
+          }
+
+          const parsed = parse(json);
+          if (parsed) return parsed;
+          if (typeof json === 'string' && json.trim().toLowerCase() === 'ok') {
+            return { healthy: true, version: '' };
+          }
+        } catch {
+          // Try next candidate.
+        }
+      }
+
+      return undefined;
+    };
+
     // NOTE: global.health() takes only an options object (no parameters arg).
-    const raw = await client.global.health(this._dataOptions());
-    if (raw && typeof raw.healthy === 'boolean') {
-      return raw as { healthy: boolean; version: string };
+    // Use throwOnError so connection errors are surfaced properly.
+    let raw: any;
+    try {
+      raw = await client.global.health(this._dataOptions({ throwOnError: true }));
+    } catch (err) {
+      const fallback = await tryFallback();
+      if (fallback) return fallback;
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`Failed to reach OpenCode server at ${this.baseUrl}: ${msg}`);
     }
-    if (raw?.data && typeof raw.data.healthy === 'boolean') {
-      return raw.data as { healthy: boolean; version: string };
-    }
-    throw new Error('Unexpected health response shape from OpenCode SDK');
+
+    const parsed = parse(raw);
+    if (parsed) return parsed;
+
+    const fallback = await tryFallback();
+    if (fallback) return fallback;
+
+    throw new Error(`Unexpected health response from OpenCode server at ${this.baseUrl}`);
   }
 
   async createSession(request?: { title?: string }): Promise<Session> {
