@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { getNonce } from './utils';
 import { OpenCodeClient } from '../api/opencodeClient';
+import type { PromptRequest } from '../api/opencodeClient';
 
 interface ConnectionHistory {
   url: string;
@@ -40,6 +41,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private _defaultModelContextLimit?: number;
   private _lastContextUsedTokens?: number;
   private _lastContextMaxTokens?: number;
+  private _currentModel?: string;
+  private _currentVariant?: string;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -224,6 +227,13 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
             });
             return;
           }
+          if (typeof data.model === 'string') {
+            this._currentModel = data.model;
+          }
+          if (typeof data.variant === 'string') {
+            const v = data.variant.trim();
+            this._currentVariant = v.length > 0 ? v : undefined;
+          }
           await this._handleSendMessage(data.text, data.agent);
           break;
         case 'newChat':
@@ -241,6 +251,12 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
             await this._handleGetModels();
           }
           break;
+        // Model/agent selection now happens inside the webview (palette UI).
+        case 'getCommands':
+          if (this._isConnected) {
+            await this._handleGetCommands();
+          }
+          break;
         case 'createSession':
           if (this._isConnected) {
             await this._handleCreateSession();
@@ -248,6 +264,23 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
           break;
         case 'healthCheck':
           await this._handleHealthCheck();
+          break;
+        case 'sendCommand':
+          if (!this._isConnected) {
+            this._view?.webview.postMessage({
+              type: 'error',
+              message: 'Not connected to OpenCode server. Please check connection.'
+            });
+            return;
+          }
+          if (typeof data.model === 'string') {
+            this._currentModel = data.model;
+          }
+          if (typeof data.variant === 'string') {
+            const v = data.variant.trim();
+            this._currentVariant = v.length > 0 ? v : undefined;
+          }
+          await this._handleSendCommand(data.command, data.arguments, data.agent);
           break;
         case 'stopGeneration':
           if (this._isConnected) {
@@ -269,6 +302,15 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         case 'modeChanged':
           break;
         case 'modelChanged':
+          if (typeof data.model === 'string') {
+            this._currentModel = data.model;
+          }
+          break;
+        case 'variantChanged':
+          if (typeof data.variant === 'string') {
+            const v = data.variant.trim();
+            this._currentVariant = v.length > 0 ? v : undefined;
+          }
           break;
         case 'showContextInfo':
           if (typeof this._lastContextUsedTokens === 'number' && typeof this._lastContextMaxTokens === 'number') {
@@ -311,6 +353,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     this._defaultModelContextLimit = undefined;
     this._lastContextUsedTokens = undefined;
     this._lastContextMaxTokens = undefined;
+    this._currentModel = undefined;
+    this._currentVariant = undefined;
     
     // Update history
     const existingIndex = this._connectionHistory.findIndex(h => h.url === url);
@@ -326,6 +370,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     // Check health with error display
     await this._handleHealthCheck(true);
   }
+
+  // Agent/model selection is handled inside the webview (picker palette).
+
 
   private async _loadModelContextLimits() {
     try {
@@ -784,16 +831,31 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         clearTimeout(this._generationSafetyTimer);
         this._generationSafetyTimer = undefined;
       }
-
       console.log('[OpenCode] Sending prompt', {
         sessionID: this._currentSessionId,
         agent,
       });
 
-      const result = await this._client.prompt(this._currentSessionId!, {
+      const request: PromptRequest = {
         parts: [{ type: 'text', text }],
         agent,
-      });
+      };
+
+      // Pass model override when available. Server expects (providerID, modelID).
+      const model = this._currentModel;
+      if (typeof model === 'string' && model.includes('/')) {
+        const [providerID, ...rest] = model.split('/');
+        const modelID = rest.join('/');
+        if (providerID && modelID) {
+          request.model = { providerID, modelID };
+        }
+      }
+
+      if (typeof this._currentVariant === 'string' && this._currentVariant.trim().length > 0) {
+        request.variant = this._currentVariant;
+      }
+
+      const result = await this._client.prompt(this._currentSessionId!, request);
 
       // Bind event filtering to the actual assistant message id.
       if (result.assistantMessageId) {
@@ -845,13 +907,14 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         agents
       });
     } catch (error) {
+      const agents = [
+        { id: 'build', name: 'Build', description: 'Code implementation and edits' },
+        { id: 'plan', name: 'Plan', description: 'Architecture and planning' },
+        { id: 'explore', name: 'Explore', description: 'Research and exploration' }
+      ];
       this._view?.webview.postMessage({
         type: 'agentsList',
-        agents: [
-          { id: 'build', name: 'Build', description: 'Code implementation and edits' },
-          { id: 'plan', name: 'Plan', description: 'Architecture and planning' },
-          { id: 'explore', name: 'Explore', description: 'Research and exploration' }
-        ]
+        agents
       });
     }
   }
@@ -899,6 +962,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         }
         await this._handleGetAgents();
         await this._handleGetModels();
+        await this._handleGetCommands();
         if (showError) {
           vscode.window.showInformationMessage(`Connected to OpenCode server at ${this._currentUrl}`);
         }
@@ -943,50 +1007,254 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
 
   private async _handleGetModels() {
     try {
+      const payload = await this._getModelsPayload();
+      this._view?.webview.postMessage({
+        type: 'modelsList',
+        models: payload.models,
+        defaultModelId: payload.defaultModelId,
+      });
+    } catch {
+      this._view?.webview.postMessage({ type: 'modelsList', models: [] });
+    }
+  }
+
+  private async _getModelsPayload(): Promise<{ models: Array<{ id: string; name: string; description?: string; variants?: Record<string, any> }>; defaultModelId?: string }> {
+    let configModel: string | undefined;
+    try {
+      const cfg = await this._client.getConfig();
+      if (cfg && typeof cfg.model === 'string' && cfg.model.length > 0) {
+        configModel = cfg.model;
+      }
+    } catch {
+      // noop
+    }
+
+    const models = await this._getAllModels();
+    const defaultModelId = (configModel && models.some((m) => m.id === configModel)) ? configModel : undefined;
+    return { models, defaultModelId };
+  }
+
+  private async _getAllModels(): Promise<Array<{ id: string; name: string; description?: string; variants?: Record<string, any> }>> {
+    const byId = new Map<string, { id: string; name: string; description?: string; variants?: Record<string, any> }>();
+
+    // Source A: /config/providers (configured providers + their model inventories)
+    try {
+      const payload = await this._client.getConfigProviders();
+      const providers = payload?.providers;
+      if (Array.isArray(providers)) {
+        for (const provider of providers) {
+          const providerID = typeof provider?.id === 'string' ? provider.id : undefined;
+          const models = provider?.models;
+          if (!providerID || !models || typeof models !== 'object') continue;
+
+          for (const [modelKey, model] of Object.entries(models)) {
+            const modelID = typeof (model as any)?.id === 'string'
+              ? (model as any).id
+              : (typeof modelKey === 'string' ? modelKey : undefined);
+            if (!modelID) continue;
+
+            const id = `${providerID}/${modelID}`;
+            const nameRaw = (model as any)?.name;
+            const name = typeof nameRaw === 'string' && nameRaw.trim().length > 0
+              ? nameRaw
+              : (modelID.split('/').pop() || modelID);
+            const descriptionRaw = (model as any)?.description;
+            const description = typeof descriptionRaw === 'string' && descriptionRaw.trim().length > 0
+              ? descriptionRaw
+              : undefined;
+
+            const variantsRaw = (model as any)?.variants;
+            const variants = variantsRaw && typeof variantsRaw === 'object' ? (variantsRaw as Record<string, any>) : undefined;
+
+            byId.set(id, { id, name, description, variants });
+          }
+        }
+      }
+    } catch {
+      // Ignore; we can still try other endpoints.
+    }
+
+    // Source B: /provider (often includes the full model catalog)
+    try {
+      const payload = await this._client.listProviders();
+      const all = payload?.all;
+      if (Array.isArray(all)) {
+        for (const provider of all) {
+          const providerID = typeof provider?.id === 'string' ? provider.id : undefined;
+          const models = provider?.models;
+          if (!providerID || !models || typeof models !== 'object') continue;
+
+          for (const [modelKey, model] of Object.entries(models)) {
+            const modelID = typeof (model as any)?.id === 'string'
+              ? (model as any).id
+              : (typeof modelKey === 'string' ? modelKey : undefined);
+            if (!modelID) continue;
+            const id = `${providerID}/${modelID}`;
+            const nameRaw = (model as any)?.name;
+            const name = typeof nameRaw === 'string' && nameRaw.trim().length > 0
+              ? nameRaw
+              : (modelID.split('/').pop() || modelID);
+            const descriptionRaw = (model as any)?.family;
+            const description = typeof descriptionRaw === 'string' && descriptionRaw.trim().length > 0
+              ? descriptionRaw
+              : undefined;
+
+            const variantsRaw = (model as any)?.variants;
+            const variants = variantsRaw && typeof variantsRaw === 'object' ? (variantsRaw as Record<string, any>) : undefined;
+
+            if (!byId.has(id)) {
+              byId.set(id, { id, name, description, variants });
+            }
+          }
+        }
+      }
+    } catch {
+      // noop
+    }
+
+    // Source C: config-derived model references as a fallback.
+    try {
       const config = await this._client.getConfig();
       const agents = config.agent || {};
-      
-      const models: Array<{ id: string; name: string; description?: string }> = [];
-      const seenModels = new Set<string>();
-      
-      Object.entries(agents).forEach(([agentId, agentConfig]) => {
-        if (agentConfig?.model && !seenModels.has(agentConfig.model)) {
-          seenModels.add(agentConfig.model);
-          const modelName = agentConfig.model.split('/').pop() || agentConfig.model;
-          models.push({
-            id: agentConfig.model,
-            name: modelName,
-            description: `Used by ${agentId} agent`
-          });
-        }
-      });
-      
-      if (config.model && !seenModels.has(config.model)) {
+
+      if (config.model && typeof config.model === 'string' && config.model.length > 0) {
         const modelName = config.model.split('/').pop() || config.model;
-        models.unshift({
-          id: config.model,
-          name: modelName,
-          description: 'Default model'
-        });
+        if (!byId.has(config.model)) {
+          byId.set(config.model, { id: config.model, name: modelName, description: 'Default model' });
+        }
       }
-      
-      if (models.length === 0) {
-        models.push(
-          { id: 'kimi-for-coding/k2p5', name: 'Kimi K2.5', description: 'Default coding model' }
-        );
-      }
-      
+
+      Object.entries(agents).forEach(([agentId, agentConfig]) => {
+        const id = agentConfig?.model;
+        if (!id || typeof id !== 'string') return;
+        if (byId.has(id)) return;
+        const modelName = id.split('/').pop() || id;
+        byId.set(id, { id, name: modelName, description: `Used by ${agentId} agent` });
+      });
+    } catch {
+      // noop
+    }
+
+    let models = Array.from(byId.values());
+    // No hardcoded fallback model here; if server exposes no models, return empty.
+
+    models.sort((a, b) => {
+      const ap = a.id.includes('/') ? a.id.split('/')[0] : '';
+      const bp = b.id.includes('/') ? b.id.split('/')[0] : '';
+      if (ap !== bp) return ap.localeCompare(bp);
+      return a.name.localeCompare(b.name);
+    });
+
+    return models;
+  }
+
+  private async _handleGetCommands() {
+    try {
+      const commands = await this._client.listCommands();
       this._view?.webview.postMessage({
-        type: 'modelsList',
-        models
+        type: 'commandsList',
+        commands,
       });
     } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      console.warn('[OpenCode] Failed to list commands:', msg);
       this._view?.webview.postMessage({
-        type: 'modelsList',
-        models: [
-          { id: 'kimi-for-coding/k2p5', name: 'Kimi K2.5', description: 'Default coding model' }
-        ]
+        type: 'commandsList',
+        commands: [],
       });
+    }
+  }
+
+  private async _handleSendCommand(command: string, args?: string, agent?: string) {
+    const sessionId = await this._ensureActiveSession();
+    this._currentSessionId = sessionId;
+
+    const cmdName = typeof command === 'string' ? command.trim().replace(/^\//, '') : '';
+    const cmdArgs = typeof args === 'string' ? args : '';
+    if (!cmdName) {
+      this._view?.webview.postMessage({ type: 'error', message: 'Missing command name.' });
+      return;
+    }
+
+    const userText = `/${cmdName}${cmdArgs ? ` ${cmdArgs}` : ''}`;
+
+    try {
+      this._view?.webview.postMessage({
+        type: 'addMessage',
+        role: 'user',
+        content: userText,
+        agent,
+      });
+
+      this._view?.webview.postMessage({
+        type: 'startStreaming',
+        agent,
+      });
+
+      this._ensureEventStream();
+
+      this._isGenerating = true;
+      this._activeAssistantMessageId = undefined;
+      this._hasReceivedTextPartUpdate = false;
+      this._suppressTextPartUpdates = false;
+      this._hasBoundStreamingMessageId = false;
+      this._generationSeq += 1;
+      const generationSeq = this._generationSeq;
+      this._generationStartedAt = Date.now();
+      this._generationHasSeenBusy = false;
+      if (this._generationSafetyTimer) {
+        clearTimeout(this._generationSafetyTimer);
+        this._generationSafetyTimer = undefined;
+      }
+
+      console.log('[OpenCode] Sending command', {
+        sessionID: this._currentSessionId,
+        command: cmdName,
+        agent,
+      });
+
+      const result = await this._client.sendCommand(this._currentSessionId!, {
+        command: cmdName,
+        arguments: cmdArgs,
+        agent,
+        model: this._currentModel,
+        variant: this._currentVariant,
+      });
+
+      if (result.assistantMessageId) {
+        this._activeAssistantMessageId = result.assistantMessageId;
+        if (!this._hasBoundStreamingMessageId) {
+          this._hasBoundStreamingMessageId = true;
+          this._view?.webview.postMessage({
+            type: 'bindStreaming',
+            messageID: result.assistantMessageId,
+          });
+        }
+      }
+
+      const fallbackAfterMs = 1200;
+      const elapsed = Date.now() - this._generationStartedAt;
+      const delay = Math.max(fallbackAfterMs - elapsed, 0);
+      if (result.text) {
+        setTimeout(() => {
+          if (this._generationSeq !== generationSeq) return;
+          if (!this._isGenerating) return;
+          if (this._hasReceivedTextPartUpdate) return;
+          this._suppressTextPartUpdates = true;
+          this._hasReceivedTextPartUpdate = true;
+          this._view?.webview.postMessage({ type: 'replaceStreaming', content: result.text });
+        }, delay);
+      }
+
+      this._generationSafetyTimer = setTimeout(() => {
+        this._endStreamingUI('safety-timeout');
+      }, 300000);
+    } catch (error) {
+      this._view?.webview.postMessage({
+        type: 'error',
+        message: error instanceof Error ? error.message : 'Unknown error',
+      });
+      this._endStreamingUI('command error');
     }
   }
 
@@ -1066,21 +1334,26 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
               <div class="input-footer">
                 <div class="selectors-row">
                   <div class="mode-selector">
-                    <select id="mode-dropdown" disabled>
-                      <option value="build">Build</option>
-                      <option value="plan">Plan</option>
-                      <option value="explore">Explore</option>
-                    </select>
-                    <span class="icon-svg"><svg viewBox="0 0 16 16"><path fill="currentColor" d="M3.146 5.646a.5.5 0 0 1 .708 0L8 9.793l4.146-4.147a.5.5 0 0 1 .708.708l-4.5 4.5a.5.5 0 0 1-.708 0l-4.5-4.5a.5.5 0 0 1 0-.708z"/></svg></span>
+                    <button id="mode-picker" class="selector-btn" type="button" disabled aria-label="Select agent">
+                      <span class="selector-label" id="mode-label">Build</span>
+                      <span class="icon-svg"><svg viewBox="0 0 16 16"><path fill="currentColor" d="M3.146 5.646a.5.5 0 0 1 .708 0L8 9.793l4.146-4.147a.5.5 0 0 1 .708.708l-4.5 4.5a.5.5 0 0 1-.708 0l-4.5-4.5a.5.5 0 0 1 0-.708z"/></svg></span>
+                    </button>
                   </div>
                    <span class="separator">|</span>
                    <div class="model-selector">
-                     <select id="model-dropdown" disabled>
-                       <option value="">Kimi K2.5</option>
-                     </select>
-                     <span class="icon-svg"><svg viewBox="0 0 16 16"><path fill="currentColor" d="M3.146 5.646a.5.5 0 0 1 .708 0L8 9.793l4.146-4.147a.5.5 0 0 1 .708.708l-4.5 4.5a.5.5 0 0 1-.708 0l-4.5-4.5a.5.5 0 0 1 0-.708z"/></svg></span>
+                      <button id="model-picker" class="selector-btn" type="button" disabled aria-label="Select model">
+                        <span class="selector-label" id="model-label">Model</span>
+                        <span class="icon-svg"><svg viewBox="0 0 16 16"><path fill="currentColor" d="M3.146 5.646a.5.5 0 0 1 .708 0L8 9.793l4.146-4.147a.5.5 0 0 1 .708.708l-4.5 4.5a.5.5 0 0 1-.708 0l-4.5-4.5a.5.5 0 0 1 0-.708z"/></svg></span>
+                      </button>
                    </div>
-                 </div>
+
+                   <div class="variant-selector">
+                      <button id="variant-picker" class="selector-btn" type="button" disabled aria-label="Select variant">
+                        <span class="selector-label" id="variant-label">Variant</span>
+                        <span class="icon-svg"><svg viewBox="0 0 16 16"><path fill="currentColor" d="M3.146 5.646a.5.5 0 0 1 .708 0L8 9.793l4.146-4.147a.5.5 0 0 1 .708.708l-4.5 4.5a.5.5 0 0 1-.708 0l-4.5-4.5a.5.5 0 0 1 0-.708z"/></svg></span>
+                      </button>
+                   </div>
+                  </div>
                 <div class="input-actions">
                   <div class="context-indicator" id="context-indicator" title="Context window usage">
                     <svg viewBox="0 0 24 24" class="context-ring">
@@ -1106,6 +1379,31 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
             <div class="connection-status" id="connection-status">
               <span class="status-dot"></span>
               <span class="status-text">disconnected</span>
+            </div>
+          </div>
+
+          <div id="slash-palette" class="slash-palette hidden" aria-hidden="true">
+            <div class="slash-panel" role="listbox" aria-label="OpenCode commands">
+              <div class="slash-head">
+                <span class="slash-title">Commands</span>
+                <span class="slash-meta" id="slash-meta"></span>
+                <span class="slash-tip">Esc to close</span>
+              </div>
+              <div id="slash-list" class="slash-list"></div>
+            </div>
+          </div>
+
+          <div id="picker-palette" class="picker-palette hidden" aria-hidden="true">
+            <div class="picker-panel" role="dialog" aria-label="Select" aria-modal="true">
+              <div class="picker-head">
+                <div class="picker-head-row">
+                  <span class="picker-title" id="picker-title">Select</span>
+                  <span class="picker-meta" id="picker-meta"></span>
+                  <span class="picker-tip">Esc to close</span>
+                </div>
+                <input id="picker-input" class="picker-input" type="text" spellcheck="false" placeholder="Type to search" />
+              </div>
+              <div id="picker-list" class="picker-list" role="listbox" aria-label="Results"></div>
             </div>
           </div>
         </div>

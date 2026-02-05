@@ -22,6 +22,17 @@ export interface Agent {
   model?: string;
 }
 
+export interface CommandInfo {
+  name: string;
+  description?: string;
+  agent?: string;
+  model?: string;
+  source?: 'command' | 'mcp' | 'skill';
+  template: string;
+  subtask?: boolean;
+  hints?: string[];
+}
+
 export interface Config {
   agent?: {
     [key: string]: {
@@ -38,10 +49,29 @@ export interface ConfigProvidersPayload {
   default: Record<string, string>;
 }
 
+export interface ProviderListPayload {
+  all: Array<any>;
+  default?: Record<string, string>;
+  connected?: string[];
+}
+
 export interface PromptRequest {
   parts: Array<{ type: 'text'; text: string }>;
   agent?: string;
   messageID?: string;
+  variant?: string;
+  model?: {
+    providerID: string;
+    modelID: string;
+  };
+}
+
+export interface CommandRequest {
+  command: string;
+  arguments: string;
+  agent?: string;
+  model?: string;
+  variant?: string;
 }
 
 type SseEvent = { type: string; properties?: any };
@@ -326,6 +356,13 @@ export class OpenCodeClient {
     }));
   }
 
+  async listCommands(): Promise<CommandInfo[]> {
+    const client = await this._getSdkClient();
+    const result = await client.command.list({ directory: this.directory }, this._dataOptions());
+    const value = result?.data ?? result;
+    return Array.isArray(value) ? (value as CommandInfo[]) : [];
+  }
+
   async getConfig(): Promise<Config> {
     const client = await this._getSdkClient();
     // Both /config and /global/config exist; /config supports directory scoping.
@@ -339,6 +376,13 @@ export class OpenCodeClient {
     return result as ConfigProvidersPayload;
   }
 
+  async listProviders(): Promise<ProviderListPayload> {
+    const client = await this._getSdkClient();
+    const result = await client.provider.list({ directory: this.directory }, this._dataOptions());
+    const value = result?.data ?? result;
+    return value as ProviderListPayload;
+  }
+
   async prompt(sessionId: string, request: PromptRequest): Promise<{ text: string; raw: any; assistantMessageId?: string }> {
     const client = await this._getSdkClient();
     // In SDK, session.prompt() maps to POST /session/{sessionID}/message
@@ -347,7 +391,31 @@ export class OpenCodeClient {
       directory: this.directory,
       messageID: request.messageID,
       agent: request.agent,
+      model: request.model,
+      variant: request.variant,
       parts: request.parts,
+    }, this._dataOptions());
+
+    const parts = (result?.parts ?? []) as any[];
+    const text = parts
+      .filter((p) => p?.type === 'text' && typeof p.text === 'string')
+      .map((p) => p.text)
+      .join('');
+
+    const assistantMessageId = result?.info?.id;
+    return { text, raw: result, assistantMessageId };
+  }
+
+  async sendCommand(sessionId: string, request: CommandRequest): Promise<{ text: string; raw: any; assistantMessageId?: string }> {
+    const client = await this._getSdkClient();
+    const result = await client.session.command({
+      sessionID: sessionId,
+      directory: this.directory,
+      agent: request.agent,
+      model: request.model,
+      variant: request.variant,
+      command: request.command,
+      arguments: request.arguments,
     }, this._dataOptions());
 
     const parts = (result?.parts ?? []) as any[];
@@ -368,6 +436,8 @@ export class OpenCodeClient {
       directory: this.directory,
       messageID: request.messageID,
       agent: request.agent,
+      model: request.model,
+      variant: request.variant,
       parts: request.parts,
     }, this._dataOptions());
   }
