@@ -1,6 +1,18 @@
 .vscode/**
-out/**
+src/**
+!src/webview/**
+out/**/*.map
+out/**/*.test.js
 node_modules/**
 .vscode-test/**
+.git/**
+.github/**
+.opencode/**
+openspec/**
+research/**
+plan.md
+ralph_opencode.mjs
+AGENTS.md
+package-lock.json
 
 *.vsix

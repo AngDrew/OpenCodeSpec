@@ -3,6 +3,10 @@
   "displayName": "OpenCodeSpec Chat",
   "description": "GitHub Copilot-like chat using OpenCode as backend",
   "version": "0.0.1",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AngDrew/OpenCodeSpec.git"
+  },
   "engines": {
     "vscode": "^1.80.0"
   },
