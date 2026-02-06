@@ -6,9 +6,21 @@ This repo integrates with `opencode serve` via `@opencode-ai/sdk/v2`.
 
 Upstream OpenCode generates session titles using a dedicated `title` agent.
 
-- It runs on the first user message (`len(msgs) == 0`) and updates `session.Title` directly.
+- It runs on the first user turn (`step === 1`) and only if the session has a default title (`Session.isDefaultTitle`).
 - It does **not** create an assistant message in the chat history for title generation.
-- The prompt contract for `title` is short, single-line, no quotes/colons, <= 50 characters.
+- The title prompt rules are concise and enforce clean, short titles.
+
+### Important implementation detail (why our extension didn't rename)
+
+OpenCode's server-side auto-rename only triggers when the session title matches OpenCode's default-title format.
+
+- Default titles are generated server-side as:
+  - `New session - <ISO timestamp>`
+  - `Child session - <ISO timestamp>`
+- If a client creates sessions with a custom title (ex: `Chat Session`), `Session.isDefaultTitle(...)` is false,
+  so auto-rename is skipped.
+
+Therefore, to mirror TUI/web/desktop behavior, clients should create new sessions without overriding `title`.
 
 ## Why this matters for the VS Code extension
 
@@ -22,5 +34,11 @@ To avoid polluting chat history and breaking streaming, title generation should 
 
 ## References (upstream)
 
-- `internal/llm/agent/agent.go`: `generateTitle(...)` updates `session.Title` and saves, triggered when the first message is processed.
-- `internal/llm/prompt/title.go`: title prompt rules (<= 50 chars, one line, no quotes/colons).
+- `packages/opencode/src/session/index.ts`
+  - `createDefaultTitle(...)`
+  - `isDefaultTitle(...)`
+- `packages/opencode/src/session/prompt.ts`
+  - `ensureTitle(...)` is called at first step and bails unless `Session.isDefaultTitle(session.title)`
+  - successful generation updates session title via `Session.update(..., { touch: false })`
+- `packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx`
+  - TUI creates sessions with `session.create({})` (no custom title override).

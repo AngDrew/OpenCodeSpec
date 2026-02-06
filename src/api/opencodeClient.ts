@@ -125,7 +125,8 @@ export class OpenCodeClient {
         const createOpencodeClient = mod.createOpencodeClient as (config: any) => any;
         return createOpencodeClient({
           baseUrl: this.baseUrl,
-          directory: this.directory,
+          // Keep the base client unscoped. We pass `directory` per call so
+          // session APIs can opt into shared/global behavior when needed.
         });
       })();
     }
@@ -431,17 +432,68 @@ export class OpenCodeClient {
 
   async createSession(request?: { title?: string; parentID?: string }): Promise<Session> {
     const client = await this._getSdkClient();
-    const result = await client.session.create({
+    const opts = this._dataOptions();
+
+    const withDir = {
       directory: this.directory,
       parentID: request?.parentID,
       title: request?.title,
-    }, this._dataOptions());
-    return result as Session;
+    };
+    const noDir = {
+      parentID: request?.parentID,
+      title: request?.title,
+    };
+
+    const calls: Array<() => Promise<any>> = [];
+    if (client?.session?.create) {
+      calls.push(() => client.session.create(noDir, opts));
+      calls.push(() => client.session.create(noDir));
+      calls.push(() => client.session.create(withDir, opts));
+      calls.push(() => client.session.create(withDir));
+    }
+
+    let lastErr: unknown;
+    for (const fn of calls) {
+      try {
+        const raw = await fn();
+        const value = raw?.data ?? raw;
+        if (value && typeof value.id === 'string') {
+          return value as Session;
+        }
+        if (raw && typeof raw.id === 'string') {
+          return raw as Session;
+        }
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    throw (lastErr instanceof Error ? lastErr : new Error('Failed to create session'));
   }
 
   async deleteSession(sessionId: string): Promise<void> {
     const client = await this._getSdkClient();
-    await client.session.delete({ sessionID: sessionId, directory: this.directory }, this._dataOptions());
+    const opts = this._dataOptions();
+
+    const calls: Array<() => Promise<any>> = [];
+    if (client?.session?.delete) {
+      calls.push(() => client.session.delete({ sessionID: sessionId }, opts));
+      calls.push(() => client.session.delete({ sessionID: sessionId }));
+      calls.push(() => client.session.delete({ sessionID: sessionId, directory: this.directory }, opts));
+      calls.push(() => client.session.delete({ sessionID: sessionId, directory: this.directory }));
+    }
+
+    let lastErr: unknown;
+    for (const fn of calls) {
+      try {
+        await fn();
+        return;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    throw (lastErr instanceof Error ? lastErr : new Error('Failed to delete session'));
   }
 
   async updateSession(sessionId: string, request?: { title?: string }): Promise<Session> {
@@ -506,14 +558,14 @@ export class OpenCodeClient {
 
     const calls: Array<() => Promise<any>> = [];
     if (client?.session?.get) {
-      calls.push(() => client.session.get({ sessionID: sessionId, directory: this.directory }, opts));
       calls.push(() => client.session.get({ sessionID: sessionId }, opts));
       calls.push(() => client.session.get(sessionId, opts));
+      calls.push(() => client.session.get({ sessionID: sessionId, directory: this.directory }, opts));
     }
     if (client?.session?.retrieve) {
-      calls.push(() => client.session.retrieve({ sessionID: sessionId, directory: this.directory }, opts));
       calls.push(() => client.session.retrieve({ sessionID: sessionId }, opts));
       calls.push(() => client.session.retrieve(sessionId, opts));
+      calls.push(() => client.session.retrieve({ sessionID: sessionId, directory: this.directory }, opts));
     }
 
     let lastErr: unknown;
@@ -539,16 +591,6 @@ export class OpenCodeClient {
 
     const calls: Array<() => Promise<any>> = [];
     if (client?.session?.list) {
-      const query = {
-        directory: this.directory,
-        limit: request?.limit,
-        search: request?.search,
-        start: request?.start,
-        roots: request?.roots,
-      };
-      calls.push(() => client.session.list(query, opts));
-      calls.push(() => client.session.list(query));
-
       const queryNoDir = {
         limit: request?.limit,
         search: request?.search,
@@ -559,6 +601,16 @@ export class OpenCodeClient {
       calls.push(() => client.session.list(queryNoDir));
       calls.push(() => client.session.list(opts));
       calls.push(() => client.session.list());
+
+      const query = {
+        directory: this.directory,
+        limit: request?.limit,
+        search: request?.search,
+        start: request?.start,
+        roots: request?.roots,
+      };
+      calls.push(() => client.session.list(query, opts));
+      calls.push(() => client.session.list(query));
     }
 
     let lastErr: unknown;
@@ -586,14 +638,16 @@ export class OpenCodeClient {
 
     const calls: Array<() => Promise<any>> = [];
     if (client?.session?.messages) {
-      calls.push(() => client.session.messages({ sessionID: sessionId, directory: this.directory, limit: request?.limit }, opts));
-      calls.push(() => client.session.messages({ sessionID: sessionId, directory: this.directory }, opts));
       calls.push(() => client.session.messages({ sessionID: sessionId }, opts));
       calls.push(() => client.session.messages(sessionId, opts));
-      calls.push(() => client.session.messages({ sessionID: sessionId, directory: this.directory, limit: request?.limit }));
-      calls.push(() => client.session.messages({ sessionID: sessionId, directory: this.directory }));
+      calls.push(() => client.session.messages({ sessionID: sessionId, limit: request?.limit }, opts));
+      calls.push(() => client.session.messages({ sessionID: sessionId }, opts));
       calls.push(() => client.session.messages({ sessionID: sessionId }));
       calls.push(() => client.session.messages(sessionId));
+      calls.push(() => client.session.messages({ sessionID: sessionId, directory: this.directory, limit: request?.limit }, opts));
+      calls.push(() => client.session.messages({ sessionID: sessionId, directory: this.directory }, opts));
+      calls.push(() => client.session.messages({ sessionID: sessionId, directory: this.directory, limit: request?.limit }));
+      calls.push(() => client.session.messages({ sessionID: sessionId, directory: this.directory }));
     }
 
     let lastErr: unknown;
@@ -617,7 +671,27 @@ export class OpenCodeClient {
 
   async abortSession(sessionId: string): Promise<void> {
     const client = await this._getSdkClient();
-    await client.session.abort({ sessionID: sessionId, directory: this.directory }, this._dataOptions());
+    const opts = this._dataOptions();
+
+    const calls: Array<() => Promise<any>> = [];
+    if (client?.session?.abort) {
+      calls.push(() => client.session.abort({ sessionID: sessionId }, opts));
+      calls.push(() => client.session.abort({ sessionID: sessionId }));
+      calls.push(() => client.session.abort({ sessionID: sessionId, directory: this.directory }, opts));
+      calls.push(() => client.session.abort({ sessionID: sessionId, directory: this.directory }));
+    }
+
+    let lastErr: unknown;
+    for (const fn of calls) {
+      try {
+        await fn();
+        return;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    throw (lastErr instanceof Error ? lastErr : new Error('Failed to abort session'));
   }
 
   async listAgents(): Promise<Agent[]> {
@@ -670,7 +744,8 @@ export class OpenCodeClient {
   async prompt(sessionId: string, request: PromptRequest): Promise<{ text: string; raw: any; assistantMessageId?: string }> {
     const client = await this._getSdkClient();
     // In SDK, session.prompt() maps to POST /session/{sessionID}/message
-    const result = await client.session.prompt({
+    const opts = this._dataOptions();
+    const withDir = {
       sessionID: sessionId,
       directory: this.directory,
       messageID: request.messageID,
@@ -678,7 +753,38 @@ export class OpenCodeClient {
       model: request.model,
       variant: request.variant,
       parts: request.parts,
-    }, this._dataOptions());
+    };
+    const noDir = {
+      sessionID: sessionId,
+      messageID: request.messageID,
+      agent: request.agent,
+      model: request.model,
+      variant: request.variant,
+      parts: request.parts,
+    };
+
+    const calls: Array<() => Promise<any>> = [];
+    if (client?.session?.prompt) {
+      calls.push(() => client.session.prompt(noDir, opts));
+      calls.push(() => client.session.prompt(noDir));
+      calls.push(() => client.session.prompt(withDir, opts));
+      calls.push(() => client.session.prompt(withDir));
+    }
+
+    let result: any;
+    let lastErr: unknown;
+    for (const fn of calls) {
+      try {
+        result = await fn();
+        break;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    if (!result) {
+      throw (lastErr instanceof Error ? lastErr : new Error('Failed to send prompt'));
+    }
 
     const parts = (result?.parts ?? []) as any[];
     const text = parts
@@ -692,7 +798,8 @@ export class OpenCodeClient {
 
   async sendCommand(sessionId: string, request: CommandRequest): Promise<{ text: string; raw: any; assistantMessageId?: string }> {
     const client = await this._getSdkClient();
-    const result = await client.session.command({
+    const opts = this._dataOptions();
+    const withDir = {
       sessionID: sessionId,
       directory: this.directory,
       agent: request.agent,
@@ -700,7 +807,38 @@ export class OpenCodeClient {
       variant: request.variant,
       command: request.command,
       arguments: request.arguments,
-    }, this._dataOptions());
+    };
+    const noDir = {
+      sessionID: sessionId,
+      agent: request.agent,
+      model: request.model,
+      variant: request.variant,
+      command: request.command,
+      arguments: request.arguments,
+    };
+
+    const calls: Array<() => Promise<any>> = [];
+    if (client?.session?.command) {
+      calls.push(() => client.session.command(noDir, opts));
+      calls.push(() => client.session.command(noDir));
+      calls.push(() => client.session.command(withDir, opts));
+      calls.push(() => client.session.command(withDir));
+    }
+
+    let result: any;
+    let lastErr: unknown;
+    for (const fn of calls) {
+      try {
+        result = await fn();
+        break;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    if (!result) {
+      throw (lastErr instanceof Error ? lastErr : new Error('Failed to send command'));
+    }
 
     const parts = (result?.parts ?? []) as any[];
     const text = parts
@@ -715,7 +853,8 @@ export class OpenCodeClient {
   async promptAsync(sessionId: string, request: PromptRequest): Promise<void> {
     const client = await this._getSdkClient();
     // In SDK, session.promptAsync() maps to POST /session/{sessionID}/prompt_async
-    await client.session.promptAsync({
+    const opts = this._dataOptions();
+    const withDir = {
       sessionID: sessionId,
       directory: this.directory,
       messageID: request.messageID,
@@ -723,15 +862,61 @@ export class OpenCodeClient {
       model: request.model,
       variant: request.variant,
       parts: request.parts,
-    }, this._dataOptions());
+    };
+    const noDir = {
+      sessionID: sessionId,
+      messageID: request.messageID,
+      agent: request.agent,
+      model: request.model,
+      variant: request.variant,
+      parts: request.parts,
+    };
+
+    const calls: Array<() => Promise<any>> = [];
+    if (client?.session?.promptAsync) {
+      calls.push(() => client.session.promptAsync(noDir, opts));
+      calls.push(() => client.session.promptAsync(noDir));
+      calls.push(() => client.session.promptAsync(withDir, opts));
+      calls.push(() => client.session.promptAsync(withDir));
+    }
+
+    let lastErr: unknown;
+    for (const fn of calls) {
+      try {
+        await fn();
+        return;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    throw (lastErr instanceof Error ? lastErr : new Error('Failed to send async prompt'));
   }
 
   async subscribeEvents(onEvent: (evt: SseEvent) => void, opts?: { signal?: AbortSignal }): Promise<void> {
     const client = await this._getSdkClient();
-    const sse = await client.event.subscribe(
-      { directory: this.directory },
-      opts?.signal ? { signal: opts.signal } : undefined
-    );
+    const subscribeOpts = opts?.signal ? { signal: opts.signal } : undefined;
+    const calls: Array<() => Promise<any>> = [];
+    if (client?.event?.subscribe) {
+      calls.push(() => client.event.subscribe({}, subscribeOpts));
+      calls.push(() => client.event.subscribe({ directory: this.directory }, subscribeOpts));
+    }
+
+    let sse: any;
+    let lastErr: unknown;
+    for (const fn of calls) {
+      try {
+        sse = await fn();
+        break;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    if (!sse) {
+      throw (lastErr instanceof Error ? lastErr : new Error('Failed to subscribe events'));
+    }
+
     for await (const evt of sse.stream as AsyncIterable<any>) {
       if (opts?.signal?.aborted) {
         break;

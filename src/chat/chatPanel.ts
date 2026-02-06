@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import { getNonce } from './utils';
 import { OpenCodeClient } from '../api/opencodeClient';
 import type { PromptRequest } from '../api/opencodeClient';
+import type { Session } from '../api/opencodeClient';
 
 interface ConnectionHistory {
   url: string;
@@ -55,6 +56,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private _sessionPrefsByUrl: Record<string, Record<string, SessionPrefs>> = {};
   private _sessionsReloadTimer?: ReturnType<typeof setTimeout>;
   private _sessionsListLimit: number = 100;
+  private _titleRenameAttemptedSessions: Set<string> = new Set();
+  private _titleRenameInFlightSessions: Set<string> = new Set();
+  private _titleRenamePendingSessions: Set<string> = new Set();
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -79,9 +83,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       if (typeof stored.url === 'string' && stored.url.length > 0) {
         this._currentUrl = stored.url;
       }
-      if (typeof stored.sessionId === 'string' && stored.sessionId.length > 0) {
-        this._currentSessionId = stored.sessionId;
-      }
+      // Intentionally do not restore the previous session ID.
+      // Default behavior should start a fresh session on startup.
+      this._currentSessionId = undefined;
       if (stored.sessionPrefsByUrl && typeof stored.sessionPrefsByUrl === 'object') {
         this._sessionPrefsByUrl = stored.sessionPrefsByUrl as Record<string, Record<string, SessionPrefs>>;
       }
@@ -133,27 +137,138 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     void this._persistSessionState();
   }
 
-  private async _ensureActiveSession(): Promise<string> {
+  private _isPlaceholderSessionTitle(title: unknown): boolean {
+    if (typeof title !== 'string') return true;
+    const normalized = title.trim().toLowerCase();
+    if (!normalized) return true;
+    return normalized === 'chat session' || normalized === 'new session';
+  }
+
+  private _buildSessionTitleFromInput(input: string): string | undefined {
+    const compact = String(input || '').replace(/\s+/g, ' ').trim();
+    if (!compact) return undefined;
+
+    const withoutPrefix = compact.startsWith('/') ? compact.slice(1).trim() : compact;
+    const sanitized = withoutPrefix.replace(/["':]/g, '').trim();
+    const base = sanitized || withoutPrefix;
+    if (!base) return undefined;
+
+    const maxLen = 50;
+    return base.length > maxLen ? base.slice(0, maxLen).trimEnd() : base;
+  }
+
+  private async _maybeRenameSessionFromFirstInput(sessionId: string, userInput: string) {
+    if (!sessionId) return;
+    if (!this._titleRenamePendingSessions.has(sessionId)) return;
+    if (this._titleRenameAttemptedSessions.has(sessionId)) return;
+    if (this._titleRenameInFlightSessions.has(sessionId)) return;
+
+    const nextTitle = this._buildSessionTitleFromInput(userInput);
+    if (!nextTitle) {
+      this._titleRenamePendingSessions.delete(sessionId);
+      this._titleRenameAttemptedSessions.add(sessionId);
+      return;
+    }
+
+    this._titleRenameInFlightSessions.add(sessionId);
+    try {
+      const session = await this._client.getSession(sessionId);
+
+      const currentTitle = typeof session?.title === 'string' ? session.title.trim() : '';
+      if (!this._isPlaceholderSessionTitle(currentTitle)) {
+        this._titleRenamePendingSessions.delete(sessionId);
+        this._titleRenameAttemptedSessions.add(sessionId);
+        return;
+      }
+
+      if (currentTitle === nextTitle) {
+        this._titleRenamePendingSessions.delete(sessionId);
+        this._titleRenameAttemptedSessions.add(sessionId);
+        return;
+      }
+
+      await this._client.updateSession(sessionId, { title: nextTitle });
+      this._titleRenamePendingSessions.delete(sessionId);
+      this._titleRenameAttemptedSessions.add(sessionId);
+      this._scheduleSessionsReload('background title rename');
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      console.warn('[OpenCode] Background title rename skipped:', msg);
+      this._titleRenameAttemptedSessions.add(sessionId);
+    } finally {
+      this._titleRenameInFlightSessions.delete(sessionId);
+    }
+  }
+
+  private _getSessionSortTimestamp(session: Session): number {
+    const s = session as any;
+    const t = s?.time;
+    if (t && typeof t.updated === 'number' && Number.isFinite(t.updated)) return t.updated;
+    if (t && typeof t.created === 'number' && Number.isFinite(t.created)) return t.created;
+
+    const parsed = Date.parse(String(s?.updatedAt || s?.createdAt || ''));
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  private async _ensureActiveSession(opts?: { preferLatest?: boolean }): Promise<string> {
     if (this._isRestoringSession) {
       // Avoid re-entrancy; return best effort.
       if (this._currentSessionId) return this._currentSessionId;
     }
 
+    const preferLatest = opts?.preferLatest === true;
+
     this._isRestoringSession = true;
     try {
       const candidate = this._currentSessionId;
-      if (candidate && String(candidate).startsWith('ses')) {
+      let isCandidateValid = false;
+      if (candidate && String(candidate).trim().length > 0) {
         try {
           await this._client.getSession(candidate);
-          await this._persistSessionState();
-          return candidate;
+          isCandidateValid = true;
+          if (!preferLatest) {
+            await this._persistSessionState();
+            return candidate;
+          }
         } catch {
           // Invalid or missing on server; fall through to create.
         }
       }
 
-      const created = await this._client.createSession({ title: 'Chat Session' });
+      if (preferLatest) {
+        try {
+          const sessions = await this._client.listSessions({
+            limit: Math.max(this._sessionsListLimit, 100),
+          });
+          const latest = (sessions || [])
+            .filter((s) => s && typeof (s as any).id === 'string' && String((s as any).id).trim().length > 0)
+            .sort((a, b) => {
+              const at = this._getSessionSortTimestamp(a as Session);
+              const bt = this._getSessionSortTimestamp(b as Session);
+              if (at !== bt) return bt - at;
+              return String((a as any).id).localeCompare(String((b as any).id));
+            })[0];
+
+          if (latest && typeof latest.id === 'string') {
+            this._currentSessionId = latest.id;
+            console.log('[OpenCode] Using latest server session:', latest.id);
+            await this._persistSessionState();
+            return latest.id;
+          }
+        } catch {
+          // noop
+        }
+
+        if (isCandidateValid && candidate) {
+          this._currentSessionId = candidate;
+          await this._persistSessionState();
+          return candidate;
+        }
+      }
+
+      const created = await this._client.createSession({});
       this._currentSessionId = created.id;
+      this._titleRenamePendingSessions.add(created.id);
       console.log('[OpenCode] Using session:', created.id);
       this._view?.webview.postMessage({
         type: 'sessionCreated',
@@ -234,8 +349,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private async _handleNewChat() {
     if (!this._isConnected) return;
 
-    const session = await this._client.createSession({ title: 'Chat Session' });
+    const session = await this._client.createSession({});
     this._currentSessionId = session.id;
+    this._titleRenamePendingSessions.add(session.id);
     this._activeAssistantMessageId = undefined;
     this._hasRenderedInitialHistory = false;
     this._lastHistorySessionId = undefined;
@@ -287,7 +403,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
             return;
           }
           if (typeof data.model === 'string') {
-            this._currentModel = data.model;
+            this._setCurrentModel(data.model);
           }
           if (typeof data.variant === 'string') {
             const v = data.variant.trim();
@@ -365,7 +481,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
             return;
           }
           if (typeof data.model === 'string') {
-            this._currentModel = data.model;
+            this._setCurrentModel(data.model);
           }
           if (typeof data.variant === 'string') {
             const v = data.variant.trim();
@@ -401,7 +517,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
           break;
         case 'modelChanged':
           if (typeof data.model === 'string') {
-            this._currentModel = data.model;
+            this._setCurrentModel(data.model);
           }
           if (this._currentUrl && this._currentSessionId) {
             this._recordSessionPrefs(this._currentUrl, this._currentSessionId, { model: this._currentModel });
@@ -457,9 +573,12 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     this._defaultModelContextLimit = undefined;
     this._lastContextUsedTokens = undefined;
     this._lastContextMaxTokens = undefined;
-    this._currentModel = undefined;
+    this._setCurrentModel(undefined);
     this._currentVariant = undefined;
     this._currentAgent = undefined;
+    this._titleRenameAttemptedSessions.clear();
+    this._titleRenameInFlightSessions.clear();
+    this._titleRenamePendingSessions.clear();
     
     // Update history
     const existingIndex = this._connectionHistory.findIndex(h => h.url === url);
@@ -519,10 +638,6 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
 
     const sessionId = String(sessionIdRaw || '').trim();
     if (!sessionId) return;
-    if (!sessionId.startsWith('ses')) {
-      console.warn('[OpenCode] Refusing to switch: invalid session id', sessionId);
-      return;
-    }
 
     // End UI streaming immediately; do not attempt to abort on the server.
     this._endStreamingUI('session switch');
@@ -550,7 +665,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       this._currentAgent = next.agent.trim();
     }
     if (next.model && typeof next.model === 'string' && next.model.trim().length > 0) {
-      this._currentModel = next.model.trim();
+      this._setCurrentModel(next.model);
     }
     if (typeof next.variant === 'string') {
       const v = next.variant.trim();
@@ -583,6 +698,116 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
 
   // Agent/model selection is handled inside the webview (picker palette).
 
+  private _normalizeModelSelectionId(modelId: unknown): string | undefined {
+    if (typeof modelId !== 'string') return undefined;
+    const trimmed = modelId.trim();
+    if (!trimmed) return undefined;
+
+    const slash = trimmed.indexOf('/');
+    if (slash <= 0 || slash >= trimmed.length - 1) {
+      return trimmed;
+    }
+
+    const providerID = trimmed.slice(0, slash).trim();
+    const rawModelID = trimmed.slice(slash + 1).trim();
+    if (!providerID || !rawModelID) return trimmed;
+
+    const prefix = `${providerID}/`;
+    const modelID = rawModelID.startsWith(prefix)
+      ? rawModelID.slice(prefix.length)
+      : rawModelID;
+    if (!modelID) return trimmed;
+
+    return `${providerID}/${modelID}`;
+  }
+
+  private _toModelOverride(modelId: unknown): { providerID: string; modelID: string } | undefined {
+    const normalized = this._normalizeModelSelectionId(modelId);
+    if (!normalized) return undefined;
+
+    const slash = normalized.indexOf('/');
+    if (slash <= 0 || slash >= normalized.length - 1) return undefined;
+
+    return {
+      providerID: normalized.slice(0, slash),
+      modelID: normalized.slice(slash + 1),
+    };
+  }
+
+  private _setCurrentModel(modelId: unknown) {
+    this._currentModel = this._normalizeModelSelectionId(modelId);
+  }
+
+  private _toModelSelectionId(modelRef: unknown): string | undefined {
+    if (typeof modelRef === 'string') {
+      return this._normalizeModelSelectionId(modelRef);
+    }
+
+    if (!modelRef || typeof modelRef !== 'object') return undefined;
+    const providerID = typeof (modelRef as any).providerID === 'string'
+      ? String((modelRef as any).providerID).trim()
+      : '';
+    const modelID = typeof (modelRef as any).modelID === 'string'
+      ? String((modelRef as any).modelID).trim()
+      : '';
+    if (!providerID || !modelID) return undefined;
+    return this._normalizeModelSelectionId(`${providerID}/${modelID}`);
+  }
+
+  private _getScopedConfigModel(cfg: unknown, scopeId: string): string | undefined {
+    if (!cfg || typeof cfg !== 'object' || !scopeId) return undefined;
+
+    const cfgAny = cfg as any;
+    const fromAgent = cfgAny?.agent && typeof cfgAny.agent === 'object'
+      ? cfgAny.agent[scopeId]?.model
+      : undefined;
+    const fromMode = cfgAny?.mode && typeof cfgAny.mode === 'object'
+      ? cfgAny.mode[scopeId]?.model
+      : undefined;
+
+    return this._toModelSelectionId(fromAgent) || this._toModelSelectionId(fromMode);
+  }
+
+  private _resolveModelFromProviderDefaults(defaults: unknown): string | undefined {
+    if (!defaults || typeof defaults !== 'object') return undefined;
+
+    const entries = Object.entries(defaults as Record<string, unknown>)
+      .filter(([providerID, modelID]) => {
+        if (typeof providerID !== 'string' || providerID.trim().length === 0) return false;
+        if (typeof modelID !== 'string' || modelID.trim().length === 0) return false;
+        return true;
+      })
+      .map(([providerID, modelID]) => [providerID.trim(), String(modelID).trim()] as const);
+
+    if (entries.length === 0) return undefined;
+
+    // If a model is already selected, prefer the default for that provider.
+    const current = this._toModelOverride(this._currentModel);
+    if (current) {
+      const match = entries.find(([providerID]) => providerID === current.providerID);
+      if (match) {
+        return this._normalizeModelSelectionId(`${match[0]}/${match[1]}`);
+      }
+    }
+
+    // If there is only one configured provider default, this is unambiguous.
+    if (entries.length === 1) {
+      const [providerID, modelID] = entries[0];
+      return this._normalizeModelSelectionId(`${providerID}/${modelID}`);
+    }
+
+    return undefined;
+  }
+
+  private async _getProviderDefaultModel(): Promise<string | undefined> {
+    try {
+      const payload = await this._client.getConfigProviders();
+      return this._resolveModelFromProviderDefaults(payload?.default);
+    } catch {
+      return undefined;
+    }
+  }
+
 
   private async _loadModelContextLimits() {
     try {
@@ -601,11 +826,17 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
             // Server returns a map keyed by modelID; AssistantMessage uses (providerID, modelID).
             // Some SDK shapes also include `model.id`; set both to be resilient.
             if (typeof modelKey === 'string' && modelKey.length > 0) {
-              this._modelContextLimitById.set(`${providerID}/${modelKey}`, ctx);
+              const idFromKey = this._normalizeModelSelectionId(`${providerID}/${modelKey}`);
+              if (idFromKey) {
+                this._modelContextLimitById.set(idFromKey, ctx);
+              }
             }
             const modelID = typeof (model as any)?.id === 'string' ? (model as any).id : undefined;
             if (modelID && modelID.length > 0) {
-              this._modelContextLimitById.set(`${providerID}/${modelID}`, ctx);
+              const idFromModel = this._normalizeModelSelectionId(`${providerID}/${modelID}`);
+              if (idFromModel) {
+                this._modelContextLimitById.set(idFromModel, ctx);
+              }
             }
           }
         }
@@ -619,7 +850,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         // If there is exactly one default provider->model mapping, use it.
         if (entries.length === 1) {
           const [providerID, modelID] = entries[0];
-          const lim = this._modelContextLimitById.get(`${providerID}/${modelID}`);
+          const defaultModelKey = this._normalizeModelSelectionId(`${providerID}/${modelID}`);
+          const lim = defaultModelKey ? this._modelContextLimitById.get(defaultModelKey) : undefined;
           if (typeof lim === 'number') {
             this._defaultModelContextLimit = lim;
           }
@@ -658,8 +890,11 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     const modelID = typeof (info as any).modelID === 'string'
       ? (info as any).modelID
       : (typeof (info as any)?.metadata?.assistant?.modelID === 'string' ? (info as any).metadata.assistant.modelID : undefined);
-    const maxTokens = (providerID && modelID)
-      ? this._modelContextLimitById.get(`${providerID}/${modelID}`)
+    const lookupKey = (providerID && modelID)
+      ? this._normalizeModelSelectionId(`${providerID}/${modelID}`)
+      : undefined;
+    const maxTokens = lookupKey
+      ? this._modelContextLimitById.get(lookupKey)
       : this._defaultModelContextLimit;
     if (typeof maxTokens !== 'number' || !Number.isFinite(maxTokens) || maxTokens <= 0) return;
 
@@ -1035,6 +1270,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private async _handleSendMessage(text: string, agent?: string) {
     const sessionId = await this._ensureActiveSession();
     this._currentSessionId = sessionId;
+    void this._maybeRenameSessionFromFirstInput(sessionId, text);
 
     try {
       this._view?.webview.postMessage({
@@ -1078,13 +1314,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       };
 
       // Pass model override when available. Server expects (providerID, modelID).
-      const model = this._currentModel;
-      if (typeof model === 'string' && model.includes('/')) {
-        const [providerID, ...rest] = model.split('/');
-        const modelID = rest.join('/');
-        if (providerID && modelID) {
-          request.model = { providerID, modelID };
-        }
+      const model = this._toModelOverride(this._currentModel);
+      if (model) {
+        request.model = model;
       }
 
       if (typeof this._currentVariant === 'string' && this._currentVariant.trim().length > 0) {
@@ -1200,27 +1432,43 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         const cfgDefaultAgent = (cfg && typeof (cfg as any).default_agent === 'string')
           ? String((cfg as any).default_agent).trim()
           : '';
-        const candidateAgent = cfgDefaultAgent || 'build';
+        const candidateAgent = cfgDefaultAgent
+          || (typeof this._currentAgent === 'string' && this._currentAgent.trim().length > 0 ? this._currentAgent.trim() : 'build');
         const found = agents.find((a) => a && a.id === candidateAgent) || agents.find((a) => a && a.id) || undefined;
         if (found && found.id) {
           defaultAgentId = found.id;
 
-          // Prefer agent's resolved model/variant, then config.agent overrides.
-          defaultAgentModel = typeof found.model === 'string' && found.model.trim().length > 0
-            ? found.model
-            : undefined;
-          defaultAgentVariant = typeof (found as any).variant === 'string' && String((found as any).variant).trim().length > 0
-            ? String((found as any).variant).trim()
-            : undefined;
-
           const agentCfg = (cfg as any)?.agent && typeof (cfg as any).agent === 'object'
             ? (cfg as any).agent[defaultAgentId]
             : undefined;
-          const cfgAgentModel = agentCfg && typeof agentCfg.model === 'string' ? agentCfg.model.trim() : '';
-          const cfgAgentVariant = agentCfg && typeof agentCfg.variant === 'string' ? agentCfg.variant.trim() : '';
+          const modeCfg = (cfg as any)?.mode && typeof (cfg as any).mode === 'object'
+            ? (cfg as any).mode[defaultAgentId]
+            : undefined;
+          const cfgModel = this._toModelSelectionId((cfg as any)?.model);
+          const cfgAgentModel = this._getScopedConfigModel(cfg, defaultAgentId);
+          const cfgAgentVariant = agentCfg && typeof agentCfg.variant === 'string'
+            ? agentCfg.variant.trim()
+            : (modeCfg && typeof modeCfg.variant === 'string' ? modeCfg.variant.trim() : '');
 
-          if (!defaultAgentModel && cfgAgentModel.length > 0) defaultAgentModel = cfgAgentModel;
-          if (!defaultAgentVariant && cfgAgentVariant.length > 0) defaultAgentVariant = cfgAgentVariant;
+          // Keep model/variant resolution in sync with OpenCode config precedence.
+          // model: config.model -> config.agent[default].model -> agent.model -> provider default
+          // variant: config.agent[default].variant -> agent.variant
+          defaultAgentModel = cfgModel;
+          if (!defaultAgentModel && cfgAgentModel) {
+            defaultAgentModel = cfgAgentModel;
+          }
+          if (!defaultAgentModel) {
+            defaultAgentModel = this._toModelSelectionId(found.model);
+          }
+          if (!defaultAgentModel) {
+            defaultAgentModel = await this._getProviderDefaultModel();
+          }
+
+          defaultAgentVariant = cfgAgentVariant.length > 0
+            ? cfgAgentVariant
+            : (typeof (found as any).variant === 'string' && String((found as any).variant).trim().length > 0
+              ? String((found as any).variant).trim()
+              : undefined);
         }
       } catch {
         // noop
@@ -1231,7 +1479,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         this._currentAgent = defaultAgentId;
       }
       if (defaultAgentModel) {
-        this._currentModel = defaultAgentModel;
+        this._setCurrentModel(defaultAgentModel);
       }
       if (defaultAgentVariant) {
         this._currentVariant = defaultAgentVariant;
@@ -1267,9 +1515,10 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
 
   private async _handleCreateSession() {
     try {
-      const session = await this._client.createSession({ title: 'Chat Session' });
+      const session = await this._client.createSession({});
       // Server enforces session IDs starting with "ses".
       this._currentSessionId = session.id;
+      this._titleRenamePendingSessions.add(session.id);
       console.log('[OpenCode] Created session:', session.id);
       await this._persistSessionState();
       this._view?.webview.postMessage({
@@ -1368,6 +1617,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private async _getModelsPayload(): Promise<{ models: Array<{ id: string; name: string; description?: string; variants?: Record<string, any> }>; defaultModelId?: string }> {
     let configModel: string | undefined;
     let agentModel: string | undefined;
+    let resolvedAgentModel: string | undefined;
+    let providerDefaultModel: string | undefined;
     try {
       let cfg: any;
       try {
@@ -1384,27 +1635,67 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         }
       }
 
-      if (cfg && typeof cfg.model === 'string' && cfg.model.length > 0) {
-        configModel = cfg.model;
-      }
+      configModel = this._toModelSelectionId((cfg as any)?.model);
 
       // If global model is not set, fall back to default agent's configured model.
       const defaultAgent = (cfg && typeof (cfg as any).default_agent === 'string')
         ? String((cfg as any).default_agent).trim()
-        : '';
-      const agentId = defaultAgent || 'build';
-      const aCfg = (cfg as any)?.agent && typeof (cfg as any).agent === 'object'
-        ? (cfg as any).agent[agentId]
-        : undefined;
-      const m = aCfg && typeof aCfg.model === 'string' ? aCfg.model.trim() : '';
-      agentModel = m.length > 0 ? m : undefined;
+        : ((cfg && typeof (cfg as any).default_mode === 'string') ? String((cfg as any).default_mode).trim() : '');
+
+      const candidateAgentIds = [
+        defaultAgent,
+        typeof this._currentAgent === 'string' ? this._currentAgent.trim() : '',
+        'build',
+      ].filter((value, index, arr) => value.length > 0 && arr.indexOf(value) === index);
+
+      for (const agentId of candidateAgentIds) {
+        const scopedModel = this._getScopedConfigModel(cfg, agentId);
+        if (scopedModel) {
+          agentModel = scopedModel;
+          break;
+        }
+      }
+
+      // Fallback to the resolved model emitted by /agent when config doesn't pin one.
+      if (!agentModel && candidateAgentIds.length > 0) {
+        try {
+          const agents = await this._client.listAgents();
+          for (const agentId of candidateAgentIds) {
+            const found = (agents || []).find((a) => a && a.id === agentId);
+            if (found && typeof found.model === 'string' && found.model.trim().length > 0) {
+              resolvedAgentModel = this._normalizeModelSelectionId(found.model);
+              break;
+            }
+          }
+        } catch {
+          // noop
+        }
+      }
+
+      providerDefaultModel = await this._getProviderDefaultModel();
     } catch {
       // noop
     }
 
-    const models = await this._getAllModels();
-    const candidate = configModel || agentModel;
-    const defaultModelId = (candidate && models.some((m) => m.id === candidate)) ? candidate : undefined;
+    let models = await this._getAllModels();
+
+    const candidates = [
+      configModel,
+      agentModel,
+      resolvedAgentModel,
+      providerDefaultModel,
+    ].filter((value): value is string => typeof value === 'string' && value.length > 0);
+    let defaultModelId = candidates.find((candidate) => models.some((m) => m.id === candidate));
+
+    // If OpenCode resolved a default model that's absent from provider inventory,
+    // include it so the picker doesn't fall back to an unrelated first item.
+    if (!defaultModelId && candidates.length > 0) {
+      const fallback = candidates[0];
+      const modelName = fallback.split('/').pop() || fallback;
+      models = [...models, { id: fallback, name: modelName, description: 'Configured model' }];
+      defaultModelId = fallback;
+    }
+
     return { models, defaultModelId };
   }
 
@@ -1427,7 +1718,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
               : (typeof modelKey === 'string' ? modelKey : undefined);
             if (!modelID) continue;
 
-            const id = `${providerID}/${modelID}`;
+            const id = this._normalizeModelSelectionId(`${providerID}/${modelID}`);
+            if (!id) continue;
             const nameRaw = (model as any)?.name;
             const name = typeof nameRaw === 'string' && nameRaw.trim().length > 0
               ? nameRaw
@@ -1455,21 +1747,25 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     // Source C: config-derived model references as a fallback.
     try {
       const config = await this._client.getConfig();
-      const agents = config.agent || {};
+      const agentScopes = config.agent && typeof config.agent === 'object' ? config.agent : {};
+      const modeScopes = (config as any)?.mode && typeof (config as any).mode === 'object' ? (config as any).mode : {};
 
-      if (config.model && typeof config.model === 'string' && config.model.length > 0) {
-        const modelName = config.model.split('/').pop() || config.model;
-        if (!byId.has(config.model)) {
-          byId.set(config.model, { id: config.model, name: modelName, description: 'Default model' });
+      const cfgModelId = this._toModelSelectionId((config as any)?.model);
+      if (cfgModelId) {
+        const id = cfgModelId;
+        if (id && !byId.has(id)) {
+          const modelName = id.split('/').pop() || id;
+          byId.set(id, { id, name: modelName, description: 'Default model' });
         }
       }
 
-      Object.entries(agents).forEach(([agentId, agentConfig]) => {
-        const id = agentConfig?.model;
-        if (!id || typeof id !== 'string') return;
+      const scopedEntries = [...Object.entries(agentScopes), ...Object.entries(modeScopes)];
+      Object.entries(Object.fromEntries(scopedEntries)).forEach(([scopeId, scopeConfig]) => {
+        const id = this._toModelSelectionId((scopeConfig as any)?.model);
+        if (!id) return;
         if (byId.has(id)) return;
         const modelName = id.split('/').pop() || id;
-        byId.set(id, { id, name: modelName, description: `Used by ${agentId} agent` });
+        byId.set(id, { id, name: modelName, description: `Used by ${scopeId} mode` });
       });
     } catch {
       // noop
@@ -1517,6 +1813,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     }
 
     const userText = `/${cmdName}${cmdArgs ? ` ${cmdArgs}` : ''}`;
+    void this._maybeRenameSessionFromFirstInput(sessionId, userText);
 
     try {
       this._view?.webview.postMessage({
@@ -1557,7 +1854,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         command: cmdName,
         arguments: cmdArgs,
         agent,
-        model: this._currentModel,
+        model: this._normalizeModelSelectionId(this._currentModel),
         variant: this._currentVariant,
       });
 
@@ -1600,12 +1897,6 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
 
   private async _handleStopGeneration() {
     if (this._currentSessionId) {
-      if (!this._currentSessionId.startsWith('ses')) {
-        console.warn('[OpenCode] Refusing to abort: invalid session id', this._currentSessionId);
-        this._endStreamingUI('abort refused (invalid session id)');
-        return;
-      }
-
       // End UI streaming immediately; abort is best-effort.
       this._endStreamingUI('user stop');
       try {

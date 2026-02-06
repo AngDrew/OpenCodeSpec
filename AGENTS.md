@@ -5,15 +5,40 @@ This file is for agentic coding agents working inside `D:\projects\js\OpenCodeSp
 
 ## Rules
 
-- if you are researching using tools like context7 or grep_app or opensrc from external sources repository, dont forget to put the research insight into the @research/ folder. it will deepen your understanding abuot the library we are using.
+- if you are researching using tools: `context7` or `grep_app` or `opensrc` from external sources repository, always put the research insight into the @research/ folder. it will deepen your knowledge! which is good!
 
 ## Repo Map
 
-- `research/` opencode dependency research result. documentation and source of truth. when working with opencode, access this directory treat it as knowledge graph
+- read as needed `research/`. to improve your knowledge! check the `research/AGENTS.md` it contains knowledge indexes. dont read everything, just read necessarily
+  - when you might want to do a research (read `## How to Research`)
 - `src/` extension source (TypeScript) + webview assets
 - `src/webview/` shipped webview JS/CSS (plain JS/CSS; not TypeScript)
 - `out/` compiled output from `tsc` (do not edit by hand)
 - `.opencode/` OpenCode config + skills (not part of the extension build)
+  
+## How to Research
+
+- using skills: `librarian` skill: delegate `explore` agent to use, dont use librarian skill directly. it will bloating our precious resource
+- using MCP tools: 
+  - internal repository:
+	- delegate `explore` agent to explore our codes. you may delegate multiple `explore` agents like as much as you want. go wild! explore everything want to know! be curious! be hungry!
+  - external repository: 
+    - you might want to choose one of them: `context7` or `grep_app` or `opensrc`
+      - context7: Get the latest documentation and code. pulls up-to-date, version-specific documentation and code examples straight from the source
+	  - grep_app: Effortlessly search for code, files, and paths across a million GitHub repositories
+	  - opensrc: Automates the process of fetching package source code so you can reference it when needed
+
+### Research Template
+
+> # Research Notes
+> 
+> ## Content Index
+> 
+> - `opencode-architecture.md`: High-level map of OpenCode components (commands, skills, OpenSpec workflow, SDK/plugin pieces).
+> 
+> ## Rules
+> 
+> - always update this when you add new md file in this research folder.
 
 ## Setup
 
