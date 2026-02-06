@@ -173,21 +173,53 @@ export class OpenCodeClient {
         throw err;
       }
 
-      // VS Code extension host on macOS often doesn't inherit the user's shell PATH.
+      // VS Code extension host doesn't always inherit the user's PATH (common on macOS,
+      // and on Windows when PATH changes after VS Code is already running).
       // Fall back to common install locations so we can still start `opencode serve`.
       const tried: string[] = [];
       const home = os.homedir();
       const isWin = process.platform === 'win32';
-      const exe = isWin ? 'opencode.exe' : 'opencode';
+
+      const nonEmpty = (v: unknown): v is string => typeof v === 'string' && v.trim().length > 0;
+      const envPath = (key: string): string | undefined => (nonEmpty(process.env[key]) ? String(process.env[key]).trim() : undefined);
+
+      const windowsBinNames = ['opencode.exe', 'opencode.cmd', 'opencode.bat'];
+      const posixBinNames = ['opencode'];
+      const binNames = isWin ? windowsBinNames : posixBinNames;
+
+      const windowsDirs = [
+        path.join(home, '.opencode', 'bin'),
+        path.join(home, '.local', 'bin'),
+        // Common global install locations (npm/pnpm/yarn).
+        envPath('npm_config_prefix'),
+        envPath('NPM_CONFIG_PREFIX'),
+        envPath('PNPM_HOME'),
+        envPath('APPDATA') ? path.join(String(process.env.APPDATA), 'npm') : undefined,
+        envPath('LOCALAPPDATA') ? path.join(String(process.env.LOCALAPPDATA), 'pnpm') : undefined,
+        envPath('LOCALAPPDATA') ? path.join(String(process.env.LOCALAPPDATA), 'Yarn', 'bin') : undefined,
+        // Common package managers / installers.
+        path.join(home, 'scoop', 'shims'),
+        envPath('ProgramData') ? path.join(String(process.env.ProgramData), 'chocolatey', 'bin') : undefined,
+        // Rust/cargo installs.
+        path.join(home, '.cargo', 'bin'),
+      ].filter(nonEmpty);
+
+      const posixCandidates = [
+        path.join(home, '.opencode', 'bin', 'opencode'),
+        path.join(home, '.local', 'bin', 'opencode'),
+        // Common system paths (best-effort).
+        '/opt/homebrew/bin/opencode',
+        '/usr/local/bin/opencode',
+        '/usr/bin/opencode',
+      ];
 
       const candidates = [
         opts?.binaryPath,
         process.env.OPENCODE_BIN,
         process.env.OPENCODE_PATH,
-        path.join(home, '.opencode', 'bin', exe),
-        path.join(home, '.local', 'bin', exe),
-        // Common system paths (best-effort).
-        ...(isWin ? [] : ['/opt/homebrew/bin/opencode', '/usr/local/bin/opencode', '/usr/bin/opencode']),
+        ...(isWin
+          ? windowsDirs.flatMap((dir) => binNames.map((name) => path.join(dir, name)))
+          : posixCandidates),
       ].filter((p): p is string => typeof p === 'string' && p.trim().length > 0);
 
       const existing = candidates.filter((p) => {
@@ -208,11 +240,15 @@ export class OpenCodeClient {
           args.push(`--log-level=${(options as any).config.logLevel}`);
         }
 
+        const ext = path.extname(binPath).toLowerCase();
+        const needsShell = isWin && (ext === '.cmd' || ext === '.bat');
         const proc = spawn(binPath, args, {
           env: {
             ...process.env,
             OPENCODE_CONFIG_CONTENT: JSON.stringify((options as any)?.config ?? {}),
           },
+          shell: needsShell,
+          windowsHide: isWin,
         });
 
         const url = await new Promise<string>((resolve, reject) => {
