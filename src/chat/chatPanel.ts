@@ -147,7 +147,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     if (collapsed === 'Chat Session') return undefined;
 
     const maxLen = 64;
-    const trimmed = collapsed.length > maxLen ? `${collapsed.slice(0, maxLen - 1).trim()}…` : collapsed;
+    const trimmed = collapsed.length > maxLen ? `${collapsed.slice(0, maxLen - 3).trim()}...` : collapsed;
     return trimmed || undefined;
   }
 
