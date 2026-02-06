@@ -1,6 +1,11 @@
 // OpenCode API Client for VS Code Extension
 // Uses the official OpenCode SDK (v2) to talk to `opencode serve`.
 
+import { spawn } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+
 const OPENCODE_BASE_URL = 'http://127.0.0.1:4096';
 
 export interface Session {
@@ -120,15 +125,151 @@ export class OpenCodeClient {
     return this._sdkClientPromise;
   }
 
-  async startServer(opts?: { hostname?: string; port?: number; timeout?: number; logLevel?: string }): Promise<{ url: string; close: () => void }> {
-    const mod = await import('@opencode-ai/sdk/v2/server');
-    const createOpencodeServer = mod.createOpencodeServer as (options: any) => Promise<{ url: string; close: () => void }>;
-    return createOpencodeServer({
+  async startServer(opts?: {
+    hostname?: string;
+    port?: number;
+    timeout?: number;
+    logLevel?: string;
+    /** Optional absolute path to `opencode` binary. */
+    binaryPath?: string;
+  }): Promise<{ url: string; close: () => void }> {
+    const normalizeLogLevel = (value: unknown): string | undefined => {
+      if (typeof value !== 'string') return undefined;
+      const v = value.trim();
+      if (!v) return undefined;
+      const upper = v.toUpperCase();
+      if (upper === 'DEBUG' || upper === 'INFO' || upper === 'WARN' || upper === 'ERROR') {
+        return upper;
+      }
+      return undefined;
+    };
+
+    const options = {
       hostname: opts?.hostname,
       port: opts?.port,
       timeout: opts?.timeout,
-      config: opts?.logLevel ? { logLevel: opts.logLevel } : undefined,
-    });
+      config: normalizeLogLevel(opts?.logLevel) ? { logLevel: normalizeLogLevel(opts?.logLevel) } : undefined,
+    };
+
+    const isSpawnNotFound = (err: unknown): boolean => {
+      const msg = err instanceof Error ? err.message : String(err);
+      return msg.includes('ENOENT') && msg.toLowerCase().includes('opencode');
+    };
+
+    try {
+      const mod = await import('@opencode-ai/sdk/v2/server');
+      const createOpencodeServer = mod.createOpencodeServer as (o: any) => Promise<{ url: string; close: () => void }>;
+      return await createOpencodeServer(options);
+    } catch (err) {
+      if (!isSpawnNotFound(err)) {
+        throw err;
+      }
+
+      // VS Code extension host on macOS often doesn't inherit the user's shell PATH.
+      // Fall back to common install locations so we can still start `opencode serve`.
+      const tried: string[] = [];
+      const home = os.homedir();
+      const isWin = process.platform === 'win32';
+      const exe = isWin ? 'opencode.exe' : 'opencode';
+
+      const candidates = [
+        opts?.binaryPath,
+        process.env.OPENCODE_BIN,
+        process.env.OPENCODE_PATH,
+        path.join(home, '.opencode', 'bin', exe),
+        path.join(home, '.local', 'bin', exe),
+        // Common system paths (best-effort).
+        ...(isWin ? [] : ['/opt/homebrew/bin/opencode', '/usr/local/bin/opencode', '/usr/bin/opencode']),
+      ].filter((p): p is string => typeof p === 'string' && p.trim().length > 0);
+
+      const existing = candidates.filter((p) => {
+        try {
+          return fs.existsSync(p) && !fs.statSync(p).isDirectory();
+        } catch {
+          return false;
+        }
+      });
+
+      const spawnServerWithBin = async (binPath: string) => {
+        const args = [
+          'serve',
+          `--hostname=${options.hostname ?? '127.0.0.1'}`,
+          `--port=${options.port ?? 4096}`,
+        ];
+        if ((options as any)?.config?.logLevel) {
+          args.push(`--log-level=${(options as any).config.logLevel}`);
+        }
+
+        const proc = spawn(binPath, args, {
+          env: {
+            ...process.env,
+            OPENCODE_CONFIG_CONTENT: JSON.stringify((options as any)?.config ?? {}),
+          },
+        });
+
+        const url = await new Promise<string>((resolve, reject) => {
+          const timeoutMs = typeof options.timeout === 'number' ? options.timeout : 5000;
+          const id = setTimeout(() => {
+            reject(new Error(`Timeout waiting for server to start after ${timeoutMs}ms`));
+          }, timeoutMs);
+
+          let output = '';
+          const onChunk = (chunk: any) => {
+            output += chunk?.toString?.() ?? String(chunk);
+            const lines = output.split('\n');
+            for (const line of lines) {
+              if (line.startsWith('opencode server listening')) {
+                const match = line.match(/on\s+(https?:\/\/[^\s]+)/);
+                if (!match) {
+                  clearTimeout(id);
+                  reject(new Error(`Failed to parse server url from output: ${line}`));
+                  return;
+                }
+                clearTimeout(id);
+                resolve(match[1]);
+                return;
+              }
+            }
+          };
+
+          proc.stdout?.on('data', onChunk);
+          proc.stderr?.on('data', onChunk);
+
+          proc.on('exit', (code) => {
+            clearTimeout(id);
+            let msg = `Server exited with code ${code}`;
+            if (output.trim()) msg += `\nServer output: ${output}`;
+            reject(new Error(msg));
+          });
+          proc.on('error', (e) => {
+            clearTimeout(id);
+            reject(e);
+          });
+        });
+
+        return {
+          url,
+          close() {
+            proc.kill();
+          },
+        };
+      };
+
+      for (const bin of existing) {
+        tried.push(bin);
+        try {
+          return await spawnServerWithBin(bin);
+        } catch {
+          // Try next candidate.
+        }
+      }
+
+      const msg = err instanceof Error ? err.message : String(err);
+      const hint = tried.length > 0
+        ? `Tried: ${tried.join(', ')}`
+        : 'No opencode binary candidates found.';
+      throw new Error(`${msg}\n${hint}`);
+    }
   }
 
   private _dataOptions(extra?: Record<string, any>): Record<string, any> {

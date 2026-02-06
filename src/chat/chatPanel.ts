@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { getNonce } from './utils';
 import { OpenCodeClient } from '../api/opencodeClient';
 import type { PromptRequest } from '../api/opencodeClient';
@@ -480,7 +482,11 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     // Try to start using the official SDK (Pattern 1, optional path).
     // If opencode is not installed globally or not on PATH, this will fail.
     try {
-      const handle = await this._client.startServer({ hostname: '127.0.0.1', port: 4096, timeout: 10000, logLevel: 'info' });
+      // Pass a binary hint for macOS when VS Code doesn't inherit the user's PATH.
+      const binHint = process.platform === 'darwin'
+        ? path.join(os.homedir(), '.opencode', 'bin', 'opencode')
+        : undefined;
+      const handle = await this._client.startServer({ hostname: '127.0.0.1', port: 4096, timeout: 10000, logLevel: 'info', binaryPath: binHint });
       this._serverHandle = handle;
       this._isServerStartedByExtension = true;
       await this._handleConnectToUrl(handle.url);
@@ -763,6 +769,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     
     const selected = await vscode.window.showQuickPick(
       [
+        { label: '$(server) Start local server (127.0.0.1:4096)', description: 'Start opencode serve and connect', url: 'start-local' },
         ...items,
         { label: '$(add) Add new server...', url: 'new' }
       ],
@@ -773,6 +780,10 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     );
     
     if (selected) {
+      if (selected.url === 'start-local') {
+        await this.startLocalServer();
+        return;
+      }
       if (selected.url === 'new') {
         const input = await vscode.window.showInputBox({
           prompt: 'Enter OpenCode server URL or port (e.g., http://localhost:4096 or just 4096)',
