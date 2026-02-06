@@ -343,3 +343,22 @@ export type Plugin = (input: PluginInput) => Promise<Hooks>;
 ```
 
 This architecture provides a robust, extensible system for AI-assisted software development with clear separation of concerns between configuration, workflow management, and execution.
+
+---
+
+## Addendum: Context Window Usage Counting
+
+When OpenCode displays "context window usage" (in its web app + TUI), it uses the
+token usage reported on the last assistant message and computes:
+
+`total = input + output + reasoning + cache.read + cache.write`
+
+Then it renders usage as a percentage of the model context limit
+(`model.limit.context`).
+
+This matters if you implement a context indicator: using only `tokens.input`
+will undercount versus upstream.
+
+Details and file references are captured in:
+
+- `research/opencode-context-window-counting.md`

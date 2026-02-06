@@ -17,6 +17,11 @@
   const connectionBar = document.getElementById('connection-bar');
   const connectionStatus = document.getElementById('connection-status');
   const contextIndicator = document.getElementById('context-indicator');
+  if (contextIndicator) {
+    contextIndicator.addEventListener('click', () => {
+      vscode.postMessage({ type: 'showContextInfo' });
+    });
+  }
   const newChatBtn = document.getElementById('new-chat-btn');
   const welcomeMessage = document.getElementById('welcome-message');
   const inputContainer = document.getElementById('input-container');
@@ -41,6 +46,8 @@
   let availableAgents = [];
   let availableModels = [];
   let availableVariants = [];
+  let hasReceivedModelsList = false;
+  let pendingDefaultsVariant = null;
   let messageElsById = new Map();
   let textByMessageId = new Map();
   let thinkingByMessageId = new Map();
@@ -570,6 +577,15 @@
       currentModel = it.id;
       updateModelLabel();
       vscode.postMessage({ type: 'modelChanged', model: currentModel });
+
+      const prevVariant = currentVariant;
+      ensureVariantsForCurrentModel();
+      if (prevVariant !== currentVariant) {
+        vscode.postMessage({
+          type: 'variantChanged',
+          variant: currentVariant === DEFAULT_VARIANT_ID ? '' : currentVariant,
+        });
+      }
     } else if (pickerKind === 'variant') {
       currentVariant = it.id;
       updateVariantLabel();
@@ -1208,16 +1224,52 @@
     
     switch (message.type) {
       case 'agentsList':
+        if ((!currentMode || currentMode === 'build') && message && typeof message.defaultAgentId === 'string' && message.defaultAgentId.length > 0) {
+          currentMode = message.defaultAgentId;
+        }
         updateModeSelector(message.agents);
         break;
         
       case 'modelsList':
-        if (message && typeof message.defaultModelId === 'string' && message.defaultModelId.length > 0) {
+        hasReceivedModelsList = true;
+        if ((!currentModel || currentModel === 'Model') && message && typeof message.defaultModelId === 'string' && message.defaultModelId.length > 0) {
           // Only trust server config default (avoid auto-picking arbitrary model).
           currentModel = message.defaultModelId;
         }
         updateModelSelector(message.models);
         ensureVariantsForCurrentModel();
+        applyPendingDefaultsVariant();
+        break;
+
+      case 'defaults':
+        if (message && typeof message.agent === 'string' && message.agent.length > 0) {
+          currentMode = message.agent;
+        }
+        if (message && typeof message.model === 'string' && message.model.length > 0) {
+          currentModel = message.model;
+        }
+        // Defer applying variant until we have a model inventory, otherwise
+        // ensureVariantsForCurrentModel() would overwrite it.
+        pendingDefaultsVariant = (message && typeof message.variant === 'string' && message.variant.length > 0)
+          ? message.variant
+          : DEFAULT_VARIANT_ID;
+        updateModeLabel();
+        updateModelLabel();
+        if (hasReceivedModelsList) {
+          ensureVariantsForCurrentModel();
+          applyPendingDefaultsVariant();
+        } else {
+          currentVariant = DEFAULT_VARIANT_ID;
+          updateVariantLabel();
+        }
+
+        // Persist defaults back to extension so sends include them.
+        vscode.postMessage({ type: 'modeChanged', mode: currentMode });
+        vscode.postMessage({ type: 'modelChanged', model: currentModel });
+        // Only persist the variant once we can validate it against the active model.
+        if (hasReceivedModelsList) {
+          vscode.postMessage({ type: 'variantChanged', variant: currentVariant === DEFAULT_VARIANT_ID ? '' : currentVariant });
+        }
         break;
 
       // Agent/model selection is handled locally (picker palette).
@@ -1428,7 +1480,14 @@
   });
 
   function updateModeSelector(agents) {
-    availableAgents = Array.isArray(agents) ? agents : [];
+    // The extension should already filter to primary agents, but be defensive
+    // in case older extension versions or server responses include subagents.
+    availableAgents = (Array.isArray(agents) ? agents : []).filter((a) => {
+      if (!a || !a.id) return false;
+      if (a.mode && a.mode !== 'primary') return false;
+      if (a.hidden === true) return false;
+      return true;
+    });
 
     if (!currentMode || !availableAgents.some(a => a && a.id === currentMode)) {
       const first = availableAgents.find(a => a && a.id);
@@ -1533,6 +1592,23 @@
     if (isPickerOpen && pickerKind === 'variant') {
       renderPickerList();
     }
+  }
+
+  function applyPendingDefaultsVariant() {
+    if (!pendingDefaultsVariant) return;
+    const next = pendingDefaultsVariant;
+    pendingDefaultsVariant = null;
+
+    // Make sure variants are derived for the current model.
+    ensureVariantsForCurrentModel();
+
+    if (next && availableVariants.some(v => v && v.id === next)) {
+      currentVariant = next;
+    } else {
+      currentVariant = DEFAULT_VARIANT_ID;
+    }
+    updateVariantLabel();
+    vscode.postMessage({ type: 'variantChanged', variant: currentVariant === DEFAULT_VARIANT_ID ? '' : currentVariant });
   }
 
   function cycleVariant(delta) {

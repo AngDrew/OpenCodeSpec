@@ -19,7 +19,15 @@ export interface Agent {
   id: string;
   name: string;
   description?: string;
+  /**
+   * Agent classification from the OpenCode server.
+   * - primary: selectable “mode” agents (e.g. build/plan)
+   * - subagent: internal agents (e.g. title/summary/compaction)
+   */
+  mode?: 'subagent' | 'primary' | 'all';
+  hidden?: boolean;
   model?: string;
+  variant?: string;
 }
 
 export interface CommandInfo {
@@ -39,9 +47,13 @@ export interface Config {
       model?: string;
       description?: string;
       disable?: boolean;
+      variant?: string;
+      mode?: 'subagent' | 'primary' | 'all';
+      hidden?: boolean;
     };
   };
   model?: string;
+  default_agent?: string;
 }
 
 export interface ConfigProvidersPayload {
@@ -352,7 +364,10 @@ export class OpenCodeClient {
       id: a.name,
       name: a.name,
       description: a.description,
+      mode: (a && typeof a.mode === 'string') ? a.mode : undefined,
+      hidden: (a && typeof a.hidden === 'boolean') ? a.hidden : undefined,
       model: a.model ? `${a.model.providerID}/${a.model.modelID}` : undefined,
+      variant: typeof a.variant === 'string' ? a.variant : undefined,
     }));
   }
 
@@ -367,6 +382,12 @@ export class OpenCodeClient {
     const client = await this._getSdkClient();
     // Both /config and /global/config exist; /config supports directory scoping.
     const cfg = await client.config.get({ directory: this.directory }, this._dataOptions());
+    return cfg as Config;
+  }
+
+  async getGlobalConfig(): Promise<Config> {
+    const client = await this._getSdkClient();
+    const cfg = await client.global.config.get(this._dataOptions());
     return cfg as Config;
   }
 

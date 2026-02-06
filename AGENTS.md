@@ -3,6 +3,10 @@
 This repo is a VS Code extension (TypeScript) that provides an OpenCode-backed chat panel.
 This file is for agentic coding agents working inside `D:\projects\js\OpenCodeSpec`.
 
+## Rules
+
+- if you are researching using tools like context7 or grep_app or opensrc from external sources repository, dont forget to put the research insight into the @research/ folder. it will deepen your understanding abuot the library we are using.
+
 ## Repo Map
 
 - `research/` opencode dependency research result. documentation and source of truth. when working with opencode, access this directory treat it as knowledge graph

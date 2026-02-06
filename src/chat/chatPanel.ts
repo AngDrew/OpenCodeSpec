@@ -43,6 +43,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private _lastContextMaxTokens?: number;
   private _currentModel?: string;
   private _currentVariant?: string;
+  private _currentAgent?: string;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -300,6 +301,10 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
           await this.stopLocalServer();
           break;
         case 'modeChanged':
+          if (typeof (data as any).mode === 'string') {
+            const m = String((data as any).mode).trim();
+            this._currentAgent = m.length > 0 ? m : undefined;
+          }
           break;
         case 'modelChanged':
           if (typeof data.model === 'string') {
@@ -425,18 +430,29 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     if (!info || typeof info !== 'object') return;
     if (info.role !== 'assistant') return;
 
-    const tokens = info.tokens;
-    const input = typeof tokens?.input === 'number' ? tokens.input : undefined;
-    if (typeof input !== 'number') return;
+    // Token usage is per-message and provider-dependent.
+    // Upstream OpenCode UI counts context usage as the sum of all reported token components
+    // (input + output + reasoning + cache.read + cache.write) for the most recent assistant
+    // message with token info.
+    const tokens = (info as any).tokens ?? (info as any)?.metadata?.assistant?.tokens;
+    if (!tokens || typeof tokens !== 'object') return;
 
-    // Best proxy for current context usage: the prompt size for the last assistant generation.
-    // OpenCode reports per-message token usage where `input` reflects the full context window
-    // consumed to generate this assistant message.
-    const usedTokens = input;
-    if (!Number.isFinite(usedTokens) || usedTokens < 0) return;
+    const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+    const input = num((tokens as any).input);
+    const output = num((tokens as any).output);
+    const reasoning = num((tokens as any).reasoning);
+    const cacheRead = num((tokens as any)?.cache?.read);
+    const cacheWrite = num((tokens as any)?.cache?.write);
 
-    const providerID = typeof info.providerID === 'string' ? info.providerID : undefined;
-    const modelID = typeof info.modelID === 'string' ? info.modelID : undefined;
+    const usedTokens = input + output + reasoning + cacheRead + cacheWrite;
+    if (!Number.isFinite(usedTokens) || usedTokens <= 0) return;
+
+    const providerID = typeof (info as any).providerID === 'string'
+      ? (info as any).providerID
+      : (typeof (info as any)?.metadata?.assistant?.providerID === 'string' ? (info as any).metadata.assistant.providerID : undefined);
+    const modelID = typeof (info as any).modelID === 'string'
+      ? (info as any).modelID
+      : (typeof (info as any)?.metadata?.assistant?.modelID === 'string' ? (info as any).metadata.assistant.modelID : undefined);
     const maxTokens = (providerID && modelID)
       ? this._modelContextLimitById.get(`${providerID}/${modelID}`)
       : this._defaultModelContextLimit;
@@ -901,11 +917,121 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
 
   private async _handleGetAgents() {
     try {
-      const agents = await this._client.listAgents();
+      const agentsRaw = await this._client.listAgents();
+
+      // Only expose primary agents as selectable "modes" in the UI.
+      // The server also returns internal/subagents (title, summary, compaction, etc.).
+      let agents = agentsRaw;
+      try {
+        const cfg = await this._client.getConfig();
+        agents = (agentsRaw || [])
+          .filter((a) => {
+            if (!a || !a.id) return false;
+            if (a.mode && a.mode !== 'primary') return false;
+            if (a.hidden === true) return false;
+
+            const agentCfg = (cfg as any)?.agent && typeof (cfg as any).agent === 'object'
+              ? (cfg as any).agent[a.id]
+              : undefined;
+            if (agentCfg && agentCfg.disable === true) return false;
+            if (agentCfg && agentCfg.hidden === true) return false;
+            if (agentCfg && typeof agentCfg.mode === 'string' && agentCfg.mode.length > 0 && agentCfg.mode !== 'primary') {
+              return false;
+            }
+            return true;
+          })
+          .map((a) => ({
+            ...a,
+            // Ensure mode is stable for the webview.
+            mode: 'primary' as const,
+          }));
+      } catch {
+        // If config isn't available, still hide non-primary agents.
+        agents = (agentsRaw || []).filter((a) => {
+          if (!a || !a.id) return false;
+          if (a.mode && a.mode !== 'primary') return false;
+          if (a.hidden === true) return false;
+          return true;
+        });
+      }
+
+      let defaultAgentId: string | undefined;
+      let defaultAgentModel: string | undefined;
+      let defaultAgentVariant: string | undefined;
+
+      // Sync default agent + its model/variant from server config.
+      try {
+        let cfg: any;
+        try {
+          cfg = await this._client.getConfig();
+        } catch {
+          cfg = undefined;
+        }
+
+        // Merge global config as a fallback (in some setups, defaults live there).
+        if (!cfg || typeof cfg !== 'object') {
+          try {
+            cfg = await this._client.getGlobalConfig();
+          } catch {
+            cfg = undefined;
+          }
+        }
+
+        const cfgDefaultAgent = (cfg && typeof (cfg as any).default_agent === 'string')
+          ? String((cfg as any).default_agent).trim()
+          : '';
+        const candidateAgent = cfgDefaultAgent || 'build';
+        const found = agents.find((a) => a && a.id === candidateAgent) || agents.find((a) => a && a.id) || undefined;
+        if (found && found.id) {
+          defaultAgentId = found.id;
+
+          // Prefer agent's resolved model/variant, then config.agent overrides.
+          defaultAgentModel = typeof found.model === 'string' && found.model.trim().length > 0
+            ? found.model
+            : undefined;
+          defaultAgentVariant = typeof (found as any).variant === 'string' && String((found as any).variant).trim().length > 0
+            ? String((found as any).variant).trim()
+            : undefined;
+
+          const agentCfg = (cfg as any)?.agent && typeof (cfg as any).agent === 'object'
+            ? (cfg as any).agent[defaultAgentId]
+            : undefined;
+          const cfgAgentModel = agentCfg && typeof agentCfg.model === 'string' ? agentCfg.model.trim() : '';
+          const cfgAgentVariant = agentCfg && typeof agentCfg.variant === 'string' ? agentCfg.variant.trim() : '';
+
+          if (!defaultAgentModel && cfgAgentModel.length > 0) defaultAgentModel = cfgAgentModel;
+          if (!defaultAgentVariant && cfgAgentVariant.length > 0) defaultAgentVariant = cfgAgentVariant;
+        }
+      } catch {
+        // noop
+      }
+
+      // Update our internal defaults for outgoing messages.
+      if (defaultAgentId) {
+        this._currentAgent = defaultAgentId;
+      }
+      if (defaultAgentModel) {
+        this._currentModel = defaultAgentModel;
+      }
+      if (defaultAgentVariant) {
+        this._currentVariant = defaultAgentVariant;
+      }
+
       this._view?.webview.postMessage({
         type: 'agentsList',
-        agents
+        agents,
+        defaultAgentId,
       });
+
+      // Send a separate defaults message so the webview can set all three fields at once.
+      if (defaultAgentId || defaultAgentModel || defaultAgentVariant) {
+        this._view?.webview.postMessage({
+          type: 'defaults',
+          agent: defaultAgentId,
+          model: defaultAgentModel,
+          variant: defaultAgentVariant,
+        });
+      }
     } catch (error) {
       const agents = [
         { id: 'build', name: 'Build', description: 'Code implementation and edits' },
@@ -1020,17 +1146,44 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
 
   private async _getModelsPayload(): Promise<{ models: Array<{ id: string; name: string; description?: string; variants?: Record<string, any> }>; defaultModelId?: string }> {
     let configModel: string | undefined;
+    let agentModel: string | undefined;
     try {
-      const cfg = await this._client.getConfig();
+      let cfg: any;
+      try {
+        cfg = await this._client.getConfig();
+      } catch {
+        cfg = undefined;
+      }
+
+      if (!cfg || typeof cfg !== 'object') {
+        try {
+          cfg = await this._client.getGlobalConfig();
+        } catch {
+          cfg = undefined;
+        }
+      }
+
       if (cfg && typeof cfg.model === 'string' && cfg.model.length > 0) {
         configModel = cfg.model;
       }
+
+      // If global model is not set, fall back to default agent's configured model.
+      const defaultAgent = (cfg && typeof (cfg as any).default_agent === 'string')
+        ? String((cfg as any).default_agent).trim()
+        : '';
+      const agentId = defaultAgent || 'build';
+      const aCfg = (cfg as any)?.agent && typeof (cfg as any).agent === 'object'
+        ? (cfg as any).agent[agentId]
+        : undefined;
+      const m = aCfg && typeof aCfg.model === 'string' ? aCfg.model.trim() : '';
+      agentModel = m.length > 0 ? m : undefined;
     } catch {
       // noop
     }
 
     const models = await this._getAllModels();
-    const defaultModelId = (configModel && models.some((m) => m.id === configModel)) ? configModel : undefined;
+    const candidate = configModel || agentModel;
+    const defaultModelId = (candidate && models.some((m) => m.id === candidate)) ? candidate : undefined;
     return { models, defaultModelId };
   }
 
@@ -1074,43 +1227,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       // Ignore; we can still try other endpoints.
     }
 
-    // Source B: /provider (often includes the full model catalog)
-    try {
-      const payload = await this._client.listProviders();
-      const all = payload?.all;
-      if (Array.isArray(all)) {
-        for (const provider of all) {
-          const providerID = typeof provider?.id === 'string' ? provider.id : undefined;
-          const models = provider?.models;
-          if (!providerID || !models || typeof models !== 'object') continue;
-
-          for (const [modelKey, model] of Object.entries(models)) {
-            const modelID = typeof (model as any)?.id === 'string'
-              ? (model as any).id
-              : (typeof modelKey === 'string' ? modelKey : undefined);
-            if (!modelID) continue;
-            const id = `${providerID}/${modelID}`;
-            const nameRaw = (model as any)?.name;
-            const name = typeof nameRaw === 'string' && nameRaw.trim().length > 0
-              ? nameRaw
-              : (modelID.split('/').pop() || modelID);
-            const descriptionRaw = (model as any)?.family;
-            const description = typeof descriptionRaw === 'string' && descriptionRaw.trim().length > 0
-              ? descriptionRaw
-              : undefined;
-
-            const variantsRaw = (model as any)?.variants;
-            const variants = variantsRaw && typeof variantsRaw === 'object' ? (variantsRaw as Record<string, any>) : undefined;
-
-            if (!byId.has(id)) {
-              byId.set(id, { id, name, description, variants });
-            }
-          }
-        }
-      }
-    } catch {
-      // noop
-    }
+    // Source B intentionally omitted: /provider often returns the entire model registry
+    // (potentially thousands of models). For UI pickers, we only want models that
+    // are configured/enabled for the user's project, which /config/providers provides.
 
     // Source C: config-derived model references as a fallback.
     try {
@@ -1348,7 +1467,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
                    </div>
 
                    <div class="variant-selector">
-                      <button id="variant-picker" class="selector-btn" type="button" disabled aria-label="Select variant">
+                      <button id="variant-picker" class="selector-btn" type="button" disabled aria-label="Select variant" title="Model variant (Ctrl+Shift+D to cycle)">
                         <span class="selector-label" id="variant-label">Variant</span>
                         <span class="icon-svg"><svg viewBox="0 0 16 16"><path fill="currentColor" d="M3.146 5.646a.5.5 0 0 1 .708 0L8 9.793l4.146-4.147a.5.5 0 0 1 .708.708l-4.5 4.5a.5.5 0 0 1-.708 0l-4.5-4.5a.5.5 0 0 1 0-.708z"/></svg></span>
                       </button>
