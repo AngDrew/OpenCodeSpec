@@ -17,6 +17,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private _view?: vscode.WebviewView;
   private _client: OpenCodeClient;
   private _currentSessionId?: string;
+  private _autoRenamedSessionIds: Set<string> = new Set();
+  private _autoRenameInFlightSessionIds: Set<string> = new Set();
   private _isConnected: boolean = false;
   private _currentUrl: string = 'http://127.0.0.1:4096';
   private _connectionHistory: ConnectionHistory[] = [];
@@ -123,6 +125,62 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       return created.id;
     } finally {
       this._isRestoringSession = false;
+    }
+  }
+
+  private _deriveSessionTitleFromUserText(rawText: string): string | undefined {
+    const input = typeof rawText === 'string' ? rawText : '';
+    if (!input.trim()) return undefined;
+
+    // Use the first non-empty line as the seed.
+    const firstLine = input
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .find((l) => l.length > 0) || '';
+    if (!firstLine) return undefined;
+
+    // Collapse whitespace and keep it short.
+    const collapsed = firstLine.replace(/\s+/g, ' ').trim();
+    if (!collapsed) return undefined;
+
+    // Avoid reusing the default placeholder title.
+    if (collapsed === 'Chat Session') return undefined;
+
+    const maxLen = 64;
+    const trimmed = collapsed.length > maxLen ? `${collapsed.slice(0, maxLen - 1).trim()}…` : collapsed;
+    return trimmed || undefined;
+  }
+
+  private async _maybeAutoRenameSessionTitle(sessionId: string, firstUserText: string): Promise<void> {
+    if (!sessionId || !String(sessionId).startsWith('ses')) return;
+    if (this._autoRenamedSessionIds.has(sessionId)) return;
+    if (this._autoRenameInFlightSessionIds.has(sessionId)) return;
+
+    const title = this._deriveSessionTitleFromUserText(firstUserText);
+    if (!title) return;
+
+    this._autoRenameInFlightSessionIds.add(sessionId);
+    try {
+      // If the server already has a non-default title, don't overwrite it.
+      try {
+        const existing = await this._client.getSession(sessionId);
+        const existingTitle = typeof (existing as any)?.title === 'string' ? String((existing as any).title).trim() : '';
+        if (existingTitle && existingTitle !== 'Chat Session') {
+          this._autoRenamedSessionIds.add(sessionId);
+          return;
+        }
+      } catch {
+        // If we can't read it, still try to update (best-effort).
+      }
+
+      await this._client.updateSession(sessionId, { title });
+      this._autoRenamedSessionIds.add(sessionId);
+      console.log('[OpenCode] Auto-renamed session title', { sessionID: sessionId, title });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      console.warn('[OpenCode] Failed to auto-rename session title:', msg);
+    } finally {
+      this._autoRenameInFlightSessionIds.delete(sessionId);
     }
   }
 
@@ -354,6 +412,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     this._currentUrl = url;
     this._client = new OpenCodeClient(url, { directory: this._workspaceDirectory });
     this._currentSessionId = undefined;
+    this._autoRenamedSessionIds.clear();
+    this._autoRenameInFlightSessionIds.clear();
     this._hasRenderedInitialHistory = false;
     this._lastHistorySessionId = undefined;
     this._modelContextLimitById.clear();
@@ -826,6 +886,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private async _handleSendMessage(text: string, agent?: string) {
     const sessionId = await this._ensureActiveSession();
     this._currentSessionId = sessionId;
+
+    // Best-effort: rename placeholder title from the first user message.
+    void this._maybeAutoRenameSessionTitle(sessionId, text);
 
     try {
       this._view?.webview.postMessage({
@@ -1307,6 +1370,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     }
 
     const userText = `/${cmdName}${cmdArgs ? ` ${cmdArgs}` : ''}`;
+
+    // Best-effort: rename placeholder title from the first user interaction (slash command).
+    void this._maybeAutoRenameSessionTitle(sessionId, userText);
 
     try {
       this._view?.webview.postMessage({

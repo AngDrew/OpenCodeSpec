@@ -394,6 +394,62 @@ export class OpenCodeClient {
     return result as Session;
   }
 
+  async updateSession(sessionId: string, request?: { title?: string }): Promise<Session> {
+    const client = await this._getSdkClient();
+    const opts = this._dataOptions();
+
+    const calls: Array<() => Promise<any>> = [];
+    if (client?.session?.update) {
+      calls.push(() => client.session.update({ sessionID: sessionId, directory: this.directory, title: request?.title }, opts));
+      calls.push(() => client.session.update({ sessionID: sessionId, title: request?.title }, opts));
+    }
+
+    let lastErr: unknown;
+    for (const fn of calls) {
+      try {
+        const raw = await fn();
+        const value = raw?.data ?? raw;
+        if (value && typeof value.id === 'string') {
+          return value as Session;
+        }
+        return raw as Session;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    // Fallback to fetch() if available (older/newer SDK mismatch).
+    const fetchImpl = (globalThis as any)?.fetch as undefined | ((...args: any[]) => Promise<any>);
+    if (typeof fetchImpl === 'function') {
+      try {
+        const url = new URL(`/session/${encodeURIComponent(sessionId)}`, this.baseUrl);
+        if (this.directory) {
+          url.searchParams.set('directory', this.directory);
+        }
+        const res = await fetchImpl(url.toString(), {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            title: request?.title,
+          }),
+        });
+        if (res?.ok) {
+          const json = typeof res.json === 'function' ? await res.json() : undefined;
+          const value = (json as any)?.data ?? json;
+          if (value && typeof value.id === 'string') {
+            return value as Session;
+          }
+        }
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    throw (lastErr instanceof Error ? lastErr : new Error('Failed to update session'));
+  }
+
   async getSession(sessionId: string): Promise<Session> {
     const client = await this._getSdkClient();
     const opts = this._dataOptions();
