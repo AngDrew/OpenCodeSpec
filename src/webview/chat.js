@@ -10,6 +10,7 @@
   const modePicker = document.getElementById('mode-picker');
   const modelPicker = document.getElementById('model-picker');
   const variantPicker = document.getElementById('variant-picker');
+  const sessionPicker = document.getElementById('session-picker');
   const modeLabel = document.getElementById('mode-label');
   const modelLabel = document.getElementById('model-label');
   const variantLabel = document.getElementById('variant-label');
@@ -42,10 +43,13 @@
   let currentModel = '';
   const DEFAULT_VARIANT_ID = '__default__';
   let currentVariant = DEFAULT_VARIANT_ID;
+  let currentSessionId = '';
   let currentUrl = 'http://127.0.0.1:4096';
   let availableAgents = [];
   let availableModels = [];
   let availableVariants = [];
+  let availableSessions = [];
+  let sessionsListLimit = 100;
   let hasReceivedModelsList = false;
   let pendingDefaultsVariant = null;
   let messageElsById = new Map();
@@ -60,9 +64,9 @@
   let slashQuery = '';
   let slashActiveIndex = 0;
 
-  // Model/Agent picker palette state
+  // Model/Agent/Variant/Session picker palette state
   let isPickerOpen = false;
-  let pickerKind = ''; // 'model' | 'agent' | 'variant'
+  let pickerKind = ''; // 'model' | 'agent' | 'variant' | 'session'
   let pickerQuery = '';
   let pickerActiveIndex = 0;
 
@@ -211,6 +215,29 @@
         cycleVariant(1);
         return;
       }
+
+      // Cmd/Ctrl+Shift+S : session picker
+      if (String(e.key) === 'S' && e.shiftKey && !e.altKey) {
+        e.preventDefault();
+        if (!isConnected) {
+          openConnectionDialog();
+          return;
+        }
+        vscode.postMessage({ type: 'getSessions', limit: sessionsListLimit });
+        openPickerPalette('session');
+        return;
+      }
+
+      if (String(e.key) === 's' && e.shiftKey && !e.altKey) {
+        e.preventDefault();
+        if (!isConnected) {
+          openConnectionDialog();
+          return;
+        }
+        vscode.postMessage({ type: 'getSessions', limit: sessionsListLimit });
+        openPickerPalette('session');
+        return;
+      }
     });
     
     // Input change for send button state
@@ -266,6 +293,19 @@
         openPickerPalette('variant');
       });
     }
+
+    if (sessionPicker) {
+      sessionPicker.addEventListener('click', () => {
+        if (!isConnected) {
+          openConnectionDialog();
+          return;
+        }
+
+        // Refresh sessions before opening.
+        vscode.postMessage({ type: 'getSessions', limit: sessionsListLimit });
+        openPickerPalette('session');
+      });
+    }
     
     // Connection status click
     connectionStatus.addEventListener('click', openConnectionDialog);
@@ -314,7 +354,7 @@
 
   function openPickerPalette(kind) {
     if (!pickerPalette || !pickerInput || !pickerList) return;
-    if (kind !== 'model' && kind !== 'agent' && kind !== 'variant') return;
+    if (kind !== 'model' && kind !== 'agent' && kind !== 'variant' && kind !== 'session') return;
 
     if (isSlashOpen) closeSlashPalette();
 
@@ -327,11 +367,15 @@
     pickerPalette.setAttribute('aria-hidden', 'false');
 
     if (pickerTitle) {
-      pickerTitle.textContent = kind === 'model' ? 'Select Model' : (kind === 'agent' ? 'Select Agent' : 'Select Variant');
+      pickerTitle.textContent = kind === 'model'
+        ? 'Select Model'
+        : (kind === 'agent' ? 'Select Agent' : (kind === 'variant' ? 'Select Variant' : 'Select Session'));
     }
     if (pickerInput) {
       pickerInput.value = '';
-      pickerInput.placeholder = kind === 'model' ? 'Search models' : (kind === 'agent' ? 'Search agents' : 'Search variants');
+      pickerInput.placeholder = kind === 'model'
+        ? 'Search models'
+        : (kind === 'agent' ? 'Search agents' : (kind === 'variant' ? 'Search variants' : 'Search sessions'));
     }
 
     // Ensure inventory is loaded.
@@ -347,9 +391,16 @@
       ensureVariantsForCurrentModel();
     }
 
+    if (kind === 'session') {
+      if (pickerMeta) pickerMeta.textContent = 'Loading sessions...';
+      vscode.postMessage({ type: 'getSessions', limit: sessionsListLimit });
+    }
+
     // Initialize active index to current selection when possible.
     const items = getPickerItems();
-    const currentId = kind === 'model' ? currentModel : (kind === 'agent' ? currentMode : currentVariant);
+    const currentId = kind === 'model'
+      ? currentModel
+      : (kind === 'agent' ? currentMode : (kind === 'variant' ? currentVariant : currentSessionId));
     const idx = items.findIndex((it) => it && it.id === currentId);
     pickerActiveIndex = idx >= 0 ? idx : 0;
 
@@ -415,6 +466,33 @@
           description: v.description || '',
           detail: v.detail || '',
         }));
+    }
+
+    if (pickerKind === 'session') {
+      return (Array.isArray(availableSessions) ? availableSessions : [])
+        .filter((s) => s && s.id)
+        .map((s) => {
+          const id = String(s.id);
+          const title = typeof s.title === 'string' ? String(s.title).trim() : '';
+          const name = title || id;
+
+          let updated = '';
+          try {
+            const tu = s.time && typeof s.time.updated === 'number' ? s.time.updated : undefined;
+            if (typeof tu === 'number' && Number.isFinite(tu) && tu > 0) {
+              updated = new Date(tu).toLocaleString();
+            }
+          } catch {
+            // noop
+          }
+          const detail = updated ? `Updated: ${updated}` : '';
+          return {
+            id,
+            name,
+            description: title ? id : '',
+            detail,
+          };
+        });
     }
 
     return [];
@@ -515,7 +593,12 @@
     if (pickerMeta) {
       const total = ranked.length;
       const q = String(pickerQuery || '').trim();
-      pickerMeta.textContent = q ? `${total} match${total === 1 ? '' : 'es'}` : `${total} item${total === 1 ? '' : 's'}`;
+      const base = q ? `${total} match${total === 1 ? '' : 'es'}` : `${total} item${total === 1 ? '' : 's'}`;
+      if (pickerKind === 'session') {
+        pickerMeta.textContent = `${base} (showing up to ${sessionsListLimit})`;
+      } else {
+        pickerMeta.textContent = base;
+      }
     }
 
     pickerActiveIndex = Math.min(pickerActiveIndex, Math.max(shown.length - 1, 0));
@@ -551,6 +634,34 @@
       pickerList.appendChild(el);
     });
 
+    if (pickerKind === 'session' && !String(pickerQuery || '').trim()) {
+      // Best-effort pagination: ask extension to increase the server-side limit.
+      // Keep it simple: only show when not searching.
+      if (shown.length >= Math.min(sessionsListLimit, 200) && sessionsListLimit < 500) {
+        const el = document.createElement('div');
+        el.className = 'picker-item';
+        el.setAttribute('role', 'option');
+        el.addEventListener('mousedown', (e) => {
+          e.preventDefault();
+        });
+        el.addEventListener('click', () => {
+          const delta = 100;
+          vscode.postMessage({ type: 'sessionListPage', delta });
+        });
+
+        const name = document.createElement('div');
+        name.className = 'picker-name';
+        name.textContent = 'Load more sessions…';
+        const desc = document.createElement('div');
+        desc.className = 'picker-desc';
+        desc.textContent = `Increase limit by 100 (current ${sessionsListLimit})`;
+
+        el.appendChild(name);
+        el.appendChild(desc);
+        pickerList.appendChild(el);
+      }
+    }
+
     ensureActiveRowInView(pickerList, '.picker-item.active');
   }
 
@@ -568,6 +679,10 @@
     const row = shown[pickerActiveIndex];
     if (!row || !row.item) return;
     const it = row.item;
+    if (pickerKind === 'session' && it && it.id === '__load_more__') {
+      // defensive; currently load-more is a separate row, not an item
+      return;
+    }
 
     if (pickerKind === 'agent') {
       currentMode = it.id;
@@ -590,6 +705,9 @@
       currentVariant = it.id;
       updateVariantLabel();
       vscode.postMessage({ type: 'variantChanged', variant: currentVariant === DEFAULT_VARIANT_ID ? '' : currentVariant });
+    } else if (pickerKind === 'session') {
+      currentSessionId = it.id;
+      vscode.postMessage({ type: 'changeSession', sessionId: currentSessionId });
     }
 
     closePickerPalette();
@@ -793,12 +911,14 @@
       if (modePicker) modePicker.disabled = false;
       if (modelPicker) modelPicker.disabled = false;
       if (variantPicker) variantPicker.disabled = false;
+      if (sessionPicker) sessionPicker.disabled = false;
       if (newChatBtn) newChatBtn.disabled = false;
       inputWrapper.classList.remove('disabled');
       
       // Request agents and models
       vscode.postMessage({ type: 'getAgents' });
       vscode.postMessage({ type: 'getModels' });
+      vscode.postMessage({ type: 'getSessions', limit: sessionsListLimit });
 
       ensureVariantsForCurrentModel();
     } else {
@@ -806,6 +926,7 @@
       if (modePicker) modePicker.disabled = true;
       if (modelPicker) modelPicker.disabled = true;
       if (variantPicker) variantPicker.disabled = true;
+      if (sessionPicker) sessionPicker.disabled = true;
       if (newChatBtn) newChatBtn.disabled = true;
       inputWrapper.classList.add('disabled');
     }
@@ -1272,6 +1393,29 @@
         }
         break;
 
+      case 'sessionsList':
+        availableSessions = Array.isArray(message.sessions) ? message.sessions : [];
+        if (message && typeof message.currentSessionId === 'string') {
+          currentSessionId = message.currentSessionId;
+        }
+        if (message && typeof message.limit === 'number' && Number.isFinite(message.limit) && message.limit > 0) {
+          sessionsListLimit = Math.max(10, Math.min(Math.floor(message.limit), 500));
+        }
+        if (isPickerOpen && pickerKind === 'session') {
+          // When sessions arrive, prefer highlighting the current session.
+          if (!String(pickerQuery || '').trim()) {
+            try {
+              const items = getPickerItems();
+              const idx = items.findIndex((it) => it && it.id === currentSessionId);
+              if (idx >= 0) pickerActiveIndex = idx;
+            } catch {
+              // noop
+            }
+          }
+          renderPickerList();
+        }
+        break;
+
       // Agent/model selection is handled locally (picker palette).
 
       case 'commandsList':
@@ -1352,6 +1496,15 @@
           }
         }
         scrollToBottom();
+        break;
+
+      case 'sessionCreated':
+        // After session creation, make sure pickers reflect latest inventories.
+        if (isConnected) {
+          vscode.postMessage({ type: 'getAgents' });
+          vscode.postMessage({ type: 'getModels' });
+          vscode.postMessage({ type: 'getSessions', limit: sessionsListLimit });
+        }
         break;
 
       case 'partUpdate':
@@ -1465,14 +1618,6 @@
         showWelcome();
         break;
 
-      case 'sessionCreated':
-        // After session creation, make sure pickers reflect latest inventories.
-        if (isConnected) {
-          vscode.postMessage({ type: 'getAgents' });
-          vscode.postMessage({ type: 'getModels' });
-        }
-        break;
-        
       case 'contextUpdate':
         updateContextIndicator(message.usedTokens, message.maxTokens);
         break;
@@ -1614,8 +1759,7 @@
   function cycleVariant(delta) {
     ensureVariantsForCurrentModel();
     const list = (Array.isArray(availableVariants) ? availableVariants : [])
-      .filter(v => v && v.id)
-      .filter(v => v.id !== DEFAULT_VARIANT_ID);
+      .filter(v => v && v.id);
     if (list.length === 0) return;
     const idx = list.findIndex(v => v.id === currentVariant);
     const nextIdx = ((idx >= 0 ? idx : 0) + delta + list.length) % list.length;

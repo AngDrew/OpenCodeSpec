@@ -11,8 +11,16 @@ const OPENCODE_BASE_URL = 'http://127.0.0.1:4096';
 export interface Session {
   id: string;
   title: string;
-  createdAt: string;
-  updatedAt: string;
+  /** Legacy/alternate server shapes (kept for compatibility). */
+  createdAt?: string;
+  updatedAt?: string;
+  /** v2 server shape: timestamps are milliseconds since epoch. */
+  time?: {
+    created?: number;
+    updated?: number;
+    compacting?: number;
+    archived?: number;
+  };
 }
 
 export interface SessionMessage {
@@ -385,13 +393,19 @@ export class OpenCodeClient {
     throw new Error(`Unexpected health response from OpenCode server at ${this.baseUrl}`);
   }
 
-  async createSession(request?: { title?: string }): Promise<Session> {
+  async createSession(request?: { title?: string; parentID?: string }): Promise<Session> {
     const client = await this._getSdkClient();
     const result = await client.session.create({
       directory: this.directory,
+      parentID: request?.parentID,
       title: request?.title,
     }, this._dataOptions());
     return result as Session;
+  }
+
+  async deleteSession(sessionId: string): Promise<void> {
+    const client = await this._getSdkClient();
+    await client.session.delete({ sessionID: sessionId, directory: this.directory }, this._dataOptions());
   }
 
   async updateSession(sessionId: string, request?: { title?: string }): Promise<Session> {
@@ -483,14 +497,30 @@ export class OpenCodeClient {
     throw (lastErr instanceof Error ? lastErr : new Error('Failed to get session'));
   }
 
-  async listSessions(): Promise<Session[]> {
+  async listSessions(request?: { limit?: number; search?: string; start?: number; roots?: boolean }): Promise<Session[]> {
     const client = await this._getSdkClient();
     const opts = this._dataOptions();
 
     const calls: Array<() => Promise<any>> = [];
     if (client?.session?.list) {
-      calls.push(() => client.session.list({ directory: this.directory }, opts));
-      calls.push(() => client.session.list({ directory: this.directory }));
+      const query = {
+        directory: this.directory,
+        limit: request?.limit,
+        search: request?.search,
+        start: request?.start,
+        roots: request?.roots,
+      };
+      calls.push(() => client.session.list(query, opts));
+      calls.push(() => client.session.list(query));
+
+      const queryNoDir = {
+        limit: request?.limit,
+        search: request?.search,
+        start: request?.start,
+        roots: request?.roots,
+      };
+      calls.push(() => client.session.list(queryNoDir, opts));
+      calls.push(() => client.session.list(queryNoDir));
       calls.push(() => client.session.list(opts));
       calls.push(() => client.session.list());
     }

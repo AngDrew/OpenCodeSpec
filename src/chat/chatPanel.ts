@@ -10,6 +10,12 @@ interface ConnectionHistory {
   lastConnected: number;
 }
 
+interface SessionPrefs {
+  agent?: string;
+  model?: string;
+  variant?: string;
+}
+
 export class ChatPanelProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'opencode.chatView';
   private static readonly _sessionStateKeyPrefix = 'opencodeChat.sessionState:';
@@ -17,8 +23,6 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private _view?: vscode.WebviewView;
   private _client: OpenCodeClient;
   private _currentSessionId?: string;
-  private _autoRenamedSessionIds: Set<string> = new Set();
-  private _autoRenameInFlightSessionIds: Set<string> = new Set();
   private _isConnected: boolean = false;
   private _currentUrl: string = 'http://127.0.0.1:4096';
   private _connectionHistory: ConnectionHistory[] = [];
@@ -48,6 +52,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private _currentModel?: string;
   private _currentVariant?: string;
   private _currentAgent?: string;
+  private _sessionPrefsByUrl: Record<string, Record<string, SessionPrefs>> = {};
+  private _sessionsReloadTimer?: ReturnType<typeof setTimeout>;
+  private _sessionsListLimit: number = 100;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -75,6 +82,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       if (typeof stored.sessionId === 'string' && stored.sessionId.length > 0) {
         this._currentSessionId = stored.sessionId;
       }
+      if (stored.sessionPrefsByUrl && typeof stored.sessionPrefsByUrl === 'object') {
+        this._sessionPrefsByUrl = stored.sessionPrefsByUrl as Record<string, Record<string, SessionPrefs>>;
+      }
       // Recreate client so baseUrl reflects restored url.
       this._client = new OpenCodeClient(this._currentUrl, { directory: this._workspaceDirectory });
     } catch {
@@ -89,10 +99,38 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         url: this._currentUrl,
         directory: this._workspaceDirectory,
         sessionId: this._currentSessionId,
+        sessionPrefsByUrl: this._sessionPrefsByUrl,
       });
     } catch {
       // noop
     }
+  }
+
+  private _getPrefsStoreForUrl(url: string): Record<string, SessionPrefs> {
+    const key = url || 'default';
+    if (!this._sessionPrefsByUrl[key]) {
+      this._sessionPrefsByUrl[key] = {};
+    }
+    return this._sessionPrefsByUrl[key];
+  }
+
+  private _getSessionPrefs(url: string, sessionId: string): SessionPrefs | undefined {
+    if (!url || !sessionId) return undefined;
+    const byId = this._sessionPrefsByUrl?.[url];
+    const prefs = byId ? byId[sessionId] : undefined;
+    if (!prefs || typeof prefs !== 'object') return undefined;
+    return prefs;
+  }
+
+  private _recordSessionPrefs(url: string, sessionId: string, patch: SessionPrefs) {
+    if (!url || !sessionId) return;
+    const byId = this._getPrefsStoreForUrl(url);
+    const prev = byId[sessionId] && typeof byId[sessionId] === 'object' ? byId[sessionId] : {};
+    byId[sessionId] = {
+      ...prev,
+      ...patch,
+    };
+    void this._persistSessionState();
   }
 
   private async _ensureActiveSession(): Promise<string> {
@@ -128,59 +166,19 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private _deriveSessionTitleFromUserText(rawText: string): string | undefined {
-    const input = typeof rawText === 'string' ? rawText : '';
-    if (!input.trim()) return undefined;
+  private _scheduleSessionsReload(reason: string) {
+    if (!this._isConnected) return;
+    if (!this._view) return;
+    if (this._sessionsReloadTimer) return;
 
-    // Use the first non-empty line as the seed.
-    const firstLine = input
-      .split(/\r?\n/)
-      .map((l) => l.trim())
-      .find((l) => l.length > 0) || '';
-    if (!firstLine) return undefined;
+    this._sessionsReloadTimer = setTimeout(() => {
+      this._sessionsReloadTimer = undefined;
+      if (!this._isConnected) return;
+      void this._handleGetSessions();
+    }, 250);
 
-    // Collapse whitespace and keep it short.
-    const collapsed = firstLine.replace(/\s+/g, ' ').trim();
-    if (!collapsed) return undefined;
-
-    // Avoid reusing the default placeholder title.
-    if (collapsed === 'Chat Session') return undefined;
-
-    const maxLen = 64;
-    const trimmed = collapsed.length > maxLen ? `${collapsed.slice(0, maxLen - 3).trim()}...` : collapsed;
-    return trimmed || undefined;
-  }
-
-  private async _maybeAutoRenameSessionTitle(sessionId: string, firstUserText: string): Promise<void> {
-    if (!sessionId || !String(sessionId).startsWith('ses')) return;
-    if (this._autoRenamedSessionIds.has(sessionId)) return;
-    if (this._autoRenameInFlightSessionIds.has(sessionId)) return;
-
-    const title = this._deriveSessionTitleFromUserText(firstUserText);
-    if (!title) return;
-
-    this._autoRenameInFlightSessionIds.add(sessionId);
-    try {
-      // If the server already has a non-default title, don't overwrite it.
-      try {
-        const existing = await this._client.getSession(sessionId);
-        const existingTitle = typeof (existing as any)?.title === 'string' ? String((existing as any).title).trim() : '';
-        if (existingTitle && existingTitle !== 'Chat Session') {
-          this._autoRenamedSessionIds.add(sessionId);
-          return;
-        }
-      } catch {
-        // If we can't read it, still try to update (best-effort).
-      }
-
-      await this._client.updateSession(sessionId, { title });
-      this._autoRenamedSessionIds.add(sessionId);
-      console.log('[OpenCode] Auto-renamed session title', { sessionID: sessionId, title });
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      console.warn('[OpenCode] Failed to auto-rename session title:', msg);
-    } finally {
-      this._autoRenameInFlightSessionIds.delete(sessionId);
+    if (reason) {
+      console.log('[OpenCode] Scheduling sessions reload:', reason);
     }
   }
 
@@ -312,6 +310,21 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
             await this._handleGetModels();
           }
           break;
+        case 'getSessions':
+          if (this._isConnected) {
+            // Allow the webview to request a larger page size (best-effort pagination).
+            try {
+              const reqLimit = typeof (data as any)?.limit === 'number' ? (data as any).limit : undefined;
+              if (typeof reqLimit === 'number' && Number.isFinite(reqLimit) && reqLimit > 0) {
+                const next = Math.max(10, Math.min(Math.floor(reqLimit), 500));
+                this._sessionsListLimit = next;
+              }
+            } catch {
+              // noop
+            }
+            await this._handleGetSessions();
+          }
+          break;
         // Model/agent selection now happens inside the webview (palette UI).
         case 'getCommands':
           if (this._isConnected) {
@@ -321,6 +334,23 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         case 'createSession':
           if (this._isConnected) {
             await this._handleCreateSession();
+          }
+          break;
+        case 'changeSession':
+          if (this._isConnected && typeof (data as any).sessionId === 'string') {
+            await this._handleChangeSession(String((data as any).sessionId));
+          }
+          break;
+        case 'sessionListPage':
+          if (this._isConnected) {
+            try {
+              const delta = typeof (data as any)?.delta === 'number' ? (data as any).delta : 0;
+              const next = this._sessionsListLimit + (Number.isFinite(delta) ? delta : 0);
+              this._sessionsListLimit = Math.max(10, Math.min(next, 500));
+            } catch {
+              // noop
+            }
+            await this._handleGetSessions();
           }
           break;
         case 'healthCheck':
@@ -365,16 +395,25 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
             const m = String((data as any).mode).trim();
             this._currentAgent = m.length > 0 ? m : undefined;
           }
+          if (this._currentUrl && this._currentSessionId) {
+            this._recordSessionPrefs(this._currentUrl, this._currentSessionId, { agent: this._currentAgent });
+          }
           break;
         case 'modelChanged':
           if (typeof data.model === 'string') {
             this._currentModel = data.model;
+          }
+          if (this._currentUrl && this._currentSessionId) {
+            this._recordSessionPrefs(this._currentUrl, this._currentSessionId, { model: this._currentModel });
           }
           break;
         case 'variantChanged':
           if (typeof data.variant === 'string') {
             const v = data.variant.trim();
             this._currentVariant = v.length > 0 ? v : undefined;
+          }
+          if (this._currentUrl && this._currentSessionId) {
+            this._recordSessionPrefs(this._currentUrl, this._currentSessionId, { variant: this._currentVariant });
           }
           break;
         case 'showContextInfo':
@@ -412,8 +451,6 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     this._currentUrl = url;
     this._client = new OpenCodeClient(url, { directory: this._workspaceDirectory });
     this._currentSessionId = undefined;
-    this._autoRenamedSessionIds.clear();
-    this._autoRenameInFlightSessionIds.clear();
     this._hasRenderedInitialHistory = false;
     this._lastHistorySessionId = undefined;
     this._modelContextLimitById.clear();
@@ -422,6 +459,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     this._lastContextMaxTokens = undefined;
     this._currentModel = undefined;
     this._currentVariant = undefined;
+    this._currentAgent = undefined;
     
     // Update history
     const existingIndex = this._connectionHistory.findIndex(h => h.url === url);
@@ -436,6 +474,111 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     
     // Check health with error display
     await this._handleHealthCheck(true);
+  }
+
+  private async _handleGetSessions() {
+    try {
+      const sessions = await this._client.listSessions({ limit: this._sessionsListLimit });
+      const list = (sessions || [])
+        .filter((s) => s && typeof (s as any).id === 'string')
+        .sort((a, b) => {
+          const at = (a as any)?.time && typeof (a as any).time.updated === 'number'
+            ? (a as any).time.updated
+            : (a as any)?.time && typeof (a as any).time.created === 'number'
+              ? (a as any).time.created
+              : Date.parse(String((a as any).updatedAt || (a as any).createdAt || ''));
+          const bt = (b as any)?.time && typeof (b as any).time.updated === 'number'
+            ? (b as any).time.updated
+            : (b as any)?.time && typeof (b as any).time.created === 'number'
+              ? (b as any).time.created
+              : Date.parse(String((b as any).updatedAt || (b as any).createdAt || ''));
+          if (Number.isFinite(at) && Number.isFinite(bt) && at !== bt) return bt - at;
+          return String((a as any).id).localeCompare(String((b as any).id));
+        });
+
+      this._view?.webview.postMessage({
+        type: 'sessionsList',
+        sessions: list,
+        currentSessionId: this._currentSessionId,
+        limit: this._sessionsListLimit,
+      });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      console.warn('[OpenCode] Failed to list sessions:', msg);
+      this._view?.webview.postMessage({
+        type: 'sessionsList',
+        sessions: [],
+        currentSessionId: this._currentSessionId,
+        limit: this._sessionsListLimit,
+      });
+    }
+  }
+
+  private async _handleChangeSession(sessionIdRaw: string) {
+    if (!this._isConnected) return;
+
+    const sessionId = String(sessionIdRaw || '').trim();
+    if (!sessionId) return;
+    if (!sessionId.startsWith('ses')) {
+      console.warn('[OpenCode] Refusing to switch: invalid session id', sessionId);
+      return;
+    }
+
+    // End UI streaming immediately; do not attempt to abort on the server.
+    this._endStreamingUI('session switch');
+
+    const prevSessionId = this._currentSessionId || (await this._ensureActiveSession());
+    const prevPrefs: SessionPrefs = {
+      agent: this._currentAgent,
+      model: this._currentModel,
+      variant: this._currentVariant,
+    };
+    if (this._currentUrl && prevSessionId) {
+      this._recordSessionPrefs(this._currentUrl, prevSessionId, prevPrefs);
+    }
+
+    this._currentSessionId = sessionId;
+    this._activeAssistantMessageId = undefined;
+    this._hasRenderedInitialHistory = false;
+    this._lastHistorySessionId = undefined;
+    this._pendingHistorySessionId = undefined;
+
+    // Prefer stored prefs for the target session; otherwise inherit from the previous session.
+    const stored = this._currentUrl ? this._getSessionPrefs(this._currentUrl, sessionId) : undefined;
+    const next = stored || prevPrefs;
+    if (next.agent && typeof next.agent === 'string' && next.agent.trim().length > 0) {
+      this._currentAgent = next.agent.trim();
+    }
+    if (next.model && typeof next.model === 'string' && next.model.trim().length > 0) {
+      this._currentModel = next.model.trim();
+    }
+    if (typeof next.variant === 'string') {
+      const v = next.variant.trim();
+      this._currentVariant = v.length > 0 ? v : undefined;
+    }
+
+    if (this._currentUrl) {
+      this._recordSessionPrefs(this._currentUrl, sessionId, {
+        agent: this._currentAgent,
+        model: this._currentModel,
+        variant: this._currentVariant,
+      });
+    }
+
+    this._view?.webview.postMessage({
+      type: 'defaults',
+      agent: this._currentAgent,
+      model: this._currentModel,
+      variant: this._currentVariant,
+    });
+
+    this._lastContextUsedTokens = undefined;
+    this._lastContextMaxTokens = undefined;
+    this._view?.webview.postMessage({ type: 'contextUpdate', usedTokens: 0, maxTokens: 1 });
+
+    await this._persistSessionState();
+    await this._loadSessionHistory(sessionId);
+    void this._handleGetSessions();
   }
 
   // Agent/model selection is handled inside the webview (picker palette).
@@ -649,6 +792,12 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
           // Note: we intentionally do not flip UI to streaming on `busy` here,
           // because the webview needs a `startStreaming` event to create a bubble.
         }
+      }
+
+      if (evt.type === 'session.updated' || evt.type === 'session.created' || evt.type === 'session.deleted') {
+        // Session titles are updated by the server in the background (uses `small_model`).
+        // Refresh the session list so the webview session picker stays current.
+        this._scheduleSessionsReload(evt.type);
       }
 
       if (evt.type === 'message.updated') {
@@ -886,9 +1035,6 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private async _handleSendMessage(text: string, agent?: string) {
     const sessionId = await this._ensureActiveSession();
     this._currentSessionId = sessionId;
-
-    // Best-effort: rename placeholder title from the first user message.
-    void this._maybeAutoRenameSessionTitle(sessionId, text);
 
     try {
       this._view?.webview.postMessage({
@@ -1162,6 +1308,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         }
         await this._handleGetAgents();
         await this._handleGetModels();
+        await this._handleGetSessions();
         await this._handleGetCommands();
         if (showError) {
           vscode.window.showInformationMessage(`Connected to OpenCode server at ${this._currentUrl}`);
@@ -1371,9 +1518,6 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
 
     const userText = `/${cmdName}${cmdArgs ? ` ${cmdArgs}` : ''}`;
 
-    // Best-effort: rename placeholder title from the first user interaction (slash command).
-    void this._maybeAutoRenameSessionTitle(sessionId, userText);
-
     try {
       this._view?.webview.postMessage({
         type: 'addMessage',
@@ -1530,14 +1674,14 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
               <div class="input-footer">
                 <div class="selectors-row">
                   <div class="mode-selector">
-                    <button id="mode-picker" class="selector-btn" type="button" disabled aria-label="Select agent">
+                    <button id="mode-picker" class="selector-btn" type="button" disabled aria-label="Select agent" title="Agent (Ctrl+. to cycle)">
                       <span class="selector-label" id="mode-label">Build</span>
                       <span class="icon-svg"><svg viewBox="0 0 16 16"><path fill="currentColor" d="M3.146 5.646a.5.5 0 0 1 .708 0L8 9.793l4.146-4.147a.5.5 0 0 1 .708.708l-4.5 4.5a.5.5 0 0 1-.708 0l-4.5-4.5a.5.5 0 0 1 0-.708z"/></svg></span>
                     </button>
                   </div>
                    <span class="separator">|</span>
                    <div class="model-selector">
-                      <button id="model-picker" class="selector-btn" type="button" disabled aria-label="Select model">
+                      <button id="model-picker" class="selector-btn" type="button" disabled aria-label="Select model" title="Model (Ctrl+' to search)">
                         <span class="selector-label" id="model-label">Model</span>
                         <span class="icon-svg"><svg viewBox="0 0 16 16"><path fill="currentColor" d="M3.146 5.646a.5.5 0 0 1 .708 0L8 9.793l4.146-4.147a.5.5 0 0 1 .708.708l-4.5 4.5a.5.5 0 0 1-.708 0l-4.5-4.5a.5.5 0 0 1 0-.708z"/></svg></span>
                       </button>
@@ -1557,6 +1701,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
                       <circle class="context-ring-fill" cx="12" cy="12" r="10" stroke-dasharray="62.8" stroke-dashoffset="62.8"/>
                     </svg>
                   </div>
+                  <button id="session-picker" class="icon-btn" title="Switch session" aria-label="Switch session">
+                    <span class="icon-svg"><svg viewBox="0 0 16 16"><path fill="currentColor" d="M2 2.75A.75.75 0 0 1 2.75 2h10.5a.75.75 0 0 1 .75.75v1.5a.75.75 0 0 1-1.5 0V3.5h-9v9h1.75a.75.75 0 0 1 0 1.5h-2.5A.75.75 0 0 1 2 13.25V2.75z"/><path fill="currentColor" d="M6.5 6.75A.75.75 0 0 1 7.25 6h6.0a.75.75 0 0 1 .75.75v6.5a.75.75 0 0 1-.75.75h-6.0a.75.75 0 0 1-.75-.75v-6.5zm1.5.75v5h4.5v-5H8z"/></svg></span>
+                  </button>
                   <button id="new-chat-btn" class="icon-btn" title="New chat">
                     <span class="icon-svg"><svg viewBox="0 0 16 16"><path fill="currentColor" d="M8 1.5a.5.5 0 0 1 .5.5v5.5H14a.5.5 0 0 1 0 1H8.5V14a.5.5 0 0 1-1 0V8.5H2a.5.5 0 0 1 0-1h5.5V2a.5.5 0 0 1 .5-.5z"/></svg></span>
                   </button>
