@@ -1,11 +1,16 @@
 import * as vscode from 'vscode';
 import { ChatPanelProvider } from './chat/chatPanel';
+import { OpenCodeConnectionRuntime } from './connection/connectionRuntime';
 
 export function activate(context: vscode.ExtensionContext) {
   console.log('OpenCodeSpec Chat extension is now active');
 
+  const connectionRuntime = new OpenCodeConnectionRuntime({
+    workspaceRoot: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+  });
+
   // Register the chat panel provider
-  const chatPanelProvider = new ChatPanelProvider(context.extensionUri, context);
+  const chatPanelProvider = new ChatPanelProvider(context.extensionUri, context, connectionRuntime);
   
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(

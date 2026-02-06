@@ -15,6 +15,49 @@ This file is for agentic coding agents working inside `D:\projects\js\OpenCodeSp
 - `src/webview/` shipped webview JS/CSS (plain JS/CSS; not TypeScript)
 - `out/` compiled output from `tsc` (do not edit by hand)
 - `.opencode/` OpenCode config + skills (not part of the extension build)
+
+## Extension <-> OpenCode Connection Architecture (Contributor Notes)
+
+The extension now uses a host-first connection model with a single runtime authority.
+
+- Runtime owner: `src/connection/connectionRuntime.ts`
+  - Tracks `serverHandle`, `isReady`, `currentServerUrl`, and workspace scope.
+- Activation wiring: `src/extension.ts`
+  - Creates one `OpenCodeConnectionRuntime` and passes it to `ChatPanelProvider`.
+- Lifecycle + orchestration: `src/chat/chatPanel.ts`
+  - Connect/start/stop flows mutate runtime-backed state.
+  - Webview bootstrap always uses canonical `initState` payload with `ready`, `serverUrl`, `workspaceRoot`, plus session defaults/context.
+  - Connection status events to webview are normalized as: `connected`, `reconnecting`, `disconnected`, `failed`.
+- Server control helpers: `src/api/opencodeClient.ts`
+  - `startServerWithRuntime(...)` and `stopServerWithRuntime(...)` keep runtime/server state aligned.
+- Transport boundary: host-proxied HTTP + SSE in `src/chat/chatPanel.ts`
+  - Proxy requests are allowed only when target origin matches the active OpenCode server origin.
+
+### Troubleshooting Flow (Contributor)
+
+Use this order when debugging extension-to-server issues.
+
+1. Verify runtime source of truth
+   - Confirm `currentServerUrl` is set on connect/start and cleared/readiness reset on stop.
+   - Check `startServerWithRuntime(...)` / `stopServerWithRuntime(...)` usage before adding any new connection path.
+
+2. Verify host->webview bootstrap contract
+   - Ensure webview triggers `webviewReady` and host responds via canonical `initState` payload.
+   - Avoid introducing alternate bootstrap messages that bypass `initState` semantics.
+
+3. Verify transport proxy origin guard
+   - If proxy calls fail, inspect origin mismatch errors (non-active origin is intentionally blocked).
+   - Keep webview network access routed through host proxy handlers, not direct arbitrary fetch/EventSource.
+
+4. Verify realtime/status behavior
+   - Check `healthStatus` transitions (`reconnecting` then `connected` after recovery).
+   - Confirm SSE interruptions trigger reconnect flow and health check revalidation.
+
+5. Verify local server startup assumptions
+   - If start fails, ensure `opencode` CLI is installed and discoverable in extension host environment.
+   - On Windows/macOS, PATH mismatch is common when VS Code was opened before shell profile updates.
+
+When adding new connection features, preserve this architecture: host-managed lifecycle, canonical init contract, strict proxy boundary, and deterministic status signaling.
   
 ## How to Research
 

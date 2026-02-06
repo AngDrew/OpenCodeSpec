@@ -5,6 +5,7 @@ import { getNonce } from './utils';
 import { OpenCodeClient } from '../api/opencodeClient';
 import type { PromptRequest } from '../api/opencodeClient';
 import type { Session } from '../api/opencodeClient';
+import { OpenCodeConnectionRuntime } from '../connection/connectionRuntime';
 
 interface ConnectionHistory {
   url: string;
@@ -17,20 +18,64 @@ interface SessionPrefs {
   variant?: string;
 }
 
+interface WebviewInitSessionDefaults {
+  agent?: string;
+  model?: string;
+  variant?: string;
+}
+
+interface WebviewInitSessionContext {
+  sessionId?: string;
+  usedTokens?: number;
+  maxTokens?: number;
+}
+
+interface WebviewInitPayload {
+  ready: boolean;
+  serverUrl: string;
+  workspaceRoot?: string;
+  sessionDefaults: WebviewInitSessionDefaults;
+  sessionContext: WebviewInitSessionContext;
+}
+
+type ConnectionStatus = 'connected' | 'reconnecting' | 'disconnected' | 'failed';
+
+interface ProxyFetchRequestMessage {
+  type: 'proxyFetch';
+  id: string;
+  url: string;
+  method?: string;
+  headers?: Record<string, unknown>;
+  body?: string;
+}
+
+interface ProxyFetchAbortMessage {
+  type: 'proxyFetchAbort';
+  id: string;
+}
+
+interface ProxySseSubscribeMessage {
+  type: 'proxySseSubscribe';
+  id: string;
+  url: string;
+  headers?: Record<string, unknown>;
+}
+
+interface ProxySseCloseMessage {
+  type: 'proxySseClose';
+  id: string;
+}
+
 export class ChatPanelProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'opencode.chatView';
   private static readonly _sessionStateKeyPrefix = 'opencodeChat.sessionState:';
   
   private _view?: vscode.WebviewView;
+  private readonly _connectionRuntime: OpenCodeConnectionRuntime;
   private _client: OpenCodeClient;
   private _currentSessionId?: string;
-  private _isConnected: boolean = false;
-  private _currentUrl: string = 'http://127.0.0.1:4096';
   private _connectionHistory: ConnectionHistory[] = [];
-  private _workspaceDirectory?: string;
   private _eventAbortController?: AbortController;
-  private _isServerStartedByExtension: boolean = false;
-  private _serverHandle?: { url: string; close: () => void };
   private _activeAssistantMessageId?: string;
   private _isGenerating: boolean = false;
   private _generationSeq: number = 0;
@@ -59,15 +104,414 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private _titleRenameAttemptedSessions: Set<string> = new Set();
   private _titleRenameInFlightSessions: Set<string> = new Set();
   private _titleRenamePendingSessions: Set<string> = new Set();
+  private _proxyFetchControllers: Map<string, AbortController> = new Map();
+  private _proxySseControllers: Map<string, AbortController> = new Map();
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
     private readonly _context: vscode.ExtensionContext,
+    connectionRuntime: OpenCodeConnectionRuntime,
   ) {
-    this._workspaceDirectory = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    this._connectionRuntime = connectionRuntime;
     this._client = new OpenCodeClient(this._currentUrl, { directory: this._workspaceDirectory });
     this._loadConnectionHistory();
     this._restorePersistedSessionState();
+  }
+
+  private get _isConnected(): boolean {
+    return this._connectionRuntime.isReady;
+  }
+
+  private set _isConnected(value: boolean) {
+    this._connectionRuntime.setReady(value);
+  }
+
+  private get _currentUrl(): string {
+    return this._connectionRuntime.currentServerUrl;
+  }
+
+  private set _currentUrl(value: string) {
+    this._connectionRuntime.setCurrentServerUrl(value);
+  }
+
+  private get _workspaceDirectory(): string | undefined {
+    return this._connectionRuntime.workspaceRoot;
+  }
+
+  private get _serverHandle(): { url: string; close: () => void } | undefined {
+    return this._connectionRuntime.serverHandle;
+  }
+
+  private set _serverHandle(handle: { url: string; close: () => void } | undefined) {
+    this._connectionRuntime.setServerHandle(handle);
+  }
+
+  private _buildWebviewInitPayload(): WebviewInitPayload {
+    const usedTokens = typeof this._lastContextUsedTokens === 'number'
+      ? this._lastContextUsedTokens
+      : undefined;
+    const maxTokens = typeof this._lastContextMaxTokens === 'number'
+      ? this._lastContextMaxTokens
+      : undefined;
+
+    return {
+      ready: this._isConnected,
+      serverUrl: this._currentUrl,
+      workspaceRoot: this._workspaceDirectory,
+      sessionDefaults: {
+        agent: this._currentAgent,
+        model: this._currentModel,
+        variant: this._currentVariant,
+      },
+      sessionContext: {
+        sessionId: this._currentSessionId,
+        usedTokens,
+        maxTokens,
+      },
+    };
+  }
+
+  private _postWebviewInitPayload() {
+    this._view?.webview.postMessage({
+      type: 'initState',
+      payload: this._buildWebviewInitPayload(),
+    });
+  }
+
+  private _postConnectionStatus(
+    status: ConnectionStatus,
+    options?: { error?: string; updateReady?: boolean },
+  ) {
+    const isConnected = status === 'connected';
+    if (options?.updateReady !== false) {
+      this._isConnected = isConnected;
+    }
+
+    const error = typeof options?.error === 'string' && options.error.trim().length > 0
+      ? options.error.trim()
+      : undefined;
+
+    this._view?.webview.postMessage({
+      type: 'healthStatus',
+      status,
+      url: this._currentUrl,
+      isConnected,
+      error,
+    });
+  }
+
+  private _normalizeProxyHeaders(input: unknown): Record<string, string> | undefined {
+    if (!input || typeof input !== 'object') return undefined;
+
+    const out: Record<string, string> = {};
+    for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
+      if (typeof key !== 'string') continue;
+      const name = key.trim();
+      if (!name) continue;
+
+      if (typeof value === 'string') {
+        out[name] = value;
+        continue;
+      }
+
+      if (typeof value === 'number' || typeof value === 'boolean') {
+        out[name] = String(value);
+      }
+    }
+
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+
+  private _resolveProxyTarget(urlRaw: unknown): { targetUrl?: URL; error?: string } {
+    const urlText = typeof urlRaw === 'string' ? urlRaw.trim() : '';
+    if (!urlText) {
+      return { error: 'Missing proxy target URL.' };
+    }
+
+    let activeUrl: URL;
+    let targetUrl: URL;
+    try {
+      activeUrl = new URL(this._currentUrl);
+      targetUrl = new URL(urlText);
+    } catch {
+      return { error: 'Invalid URL for host proxy request.' };
+    }
+
+    const isHttp = targetUrl.protocol === 'http:' || targetUrl.protocol === 'https:';
+    if (!isHttp) {
+      return { error: 'Host proxy supports only http/https targets.' };
+    }
+
+    if (targetUrl.origin !== activeUrl.origin) {
+      return {
+        error: `Host proxy blocked origin ${targetUrl.origin}; active OpenCode origin is ${activeUrl.origin}.`,
+      };
+    }
+
+    return { targetUrl };
+  }
+
+  private _abortAllProxyTransports() {
+    for (const controller of this._proxyFetchControllers.values()) {
+      try {
+        controller.abort();
+      } catch {
+        // noop
+      }
+    }
+    this._proxyFetchControllers.clear();
+
+    for (const controller of this._proxySseControllers.values()) {
+      try {
+        controller.abort();
+      } catch {
+        // noop
+      }
+    }
+    this._proxySseControllers.clear();
+  }
+
+  private _postProxyFetchResult(payload: {
+    id: string;
+    ok: boolean;
+    status?: number;
+    statusText?: string;
+    headers?: Record<string, string>;
+    bodyText?: string;
+    error?: string;
+  }) {
+    this._view?.webview.postMessage({
+      type: 'proxyFetchResult',
+      ...payload,
+    });
+  }
+
+  private async _handleProxyFetch(message: ProxyFetchRequestMessage): Promise<void> {
+    const id = typeof message?.id === 'string' ? message.id.trim() : '';
+    if (!id) return;
+
+    const resolved = this._resolveProxyTarget(message?.url);
+    if (!resolved.targetUrl) {
+      this._postProxyFetchResult({ id, ok: false, error: resolved.error || 'Invalid proxy fetch target.' });
+      return;
+    }
+
+    const fetchImpl = (globalThis as any)?.fetch as undefined | ((...args: any[]) => Promise<any>);
+    if (typeof fetchImpl !== 'function') {
+      this._postProxyFetchResult({ id, ok: false, error: 'Host fetch() is not available.' });
+      return;
+    }
+
+    const existing = this._proxyFetchControllers.get(id);
+    if (existing) {
+      try {
+        existing.abort();
+      } catch {
+        // noop
+      }
+      this._proxyFetchControllers.delete(id);
+    }
+
+    const controller = new AbortController();
+    this._proxyFetchControllers.set(id, controller);
+
+    try {
+      const method = typeof message.method === 'string' && message.method.trim().length > 0
+        ? message.method.trim().toUpperCase()
+        : 'GET';
+      const headers = this._normalizeProxyHeaders(message.headers);
+      const body = typeof message.body === 'string' ? message.body : undefined;
+
+      const res = await fetchImpl(resolved.targetUrl.toString(), {
+        method,
+        headers,
+        body,
+        signal: controller.signal,
+      });
+
+      const bodyText = typeof res?.text === 'function' ? await res.text() : '';
+      const responseHeaders: Record<string, string> = {};
+      if (res?.headers && typeof res.headers.forEach === 'function') {
+        res.headers.forEach((value: unknown, key: unknown) => {
+          if (typeof key !== 'string' || typeof value !== 'string') return;
+          responseHeaders[key] = value;
+        });
+      }
+
+      this._postProxyFetchResult({
+        id,
+        ok: true,
+        status: typeof res?.status === 'number' ? res.status : undefined,
+        statusText: typeof res?.statusText === 'string' ? res.statusText : undefined,
+        headers: responseHeaders,
+        bodyText,
+      });
+    } catch (error) {
+      const aborted = controller.signal.aborted || (error instanceof Error && error.name === 'AbortError');
+      this._postProxyFetchResult({
+        id,
+        ok: false,
+        error: aborted
+          ? 'Proxy fetch aborted.'
+          : (error instanceof Error ? error.message : String(error)),
+      });
+    } finally {
+      if (this._proxyFetchControllers.get(id) === controller) {
+        this._proxyFetchControllers.delete(id);
+      }
+    }
+  }
+
+  private _emitProxySseEvent(id: string, rawEvent: string) {
+    const lines = rawEvent.split('\n');
+    const dataLines: string[] = [];
+    let eventName: string | undefined;
+    let eventID: string | undefined;
+
+    for (const lineRaw of lines) {
+      const line = lineRaw.trimEnd();
+      if (!line) continue;
+      if (line.startsWith(':')) continue;
+
+      const sep = line.indexOf(':');
+      const field = sep >= 0 ? line.slice(0, sep) : line;
+      const valueRaw = sep >= 0 ? line.slice(sep + 1) : '';
+      const value = valueRaw.startsWith(' ') ? valueRaw.slice(1) : valueRaw;
+
+      if (field === 'data') {
+        dataLines.push(value);
+      } else if (field === 'event') {
+        eventName = value;
+      } else if (field === 'id') {
+        eventID = value;
+      }
+    }
+
+    if (dataLines.length === 0) return;
+
+    this._view?.webview.postMessage({
+      type: 'proxySseEvent',
+      id,
+      data: dataLines.join('\n'),
+      event: eventName,
+      eventID,
+    });
+  }
+
+  private _postProxySseError(id: string, error: string) {
+    this._view?.webview.postMessage({
+      type: 'proxySseError',
+      id,
+      error,
+    });
+  }
+
+  private _postProxySseClosed(id: string) {
+    this._view?.webview.postMessage({
+      type: 'proxySseClosed',
+      id,
+    });
+  }
+
+  private _handleProxySseClose(message: ProxySseCloseMessage) {
+    const id = typeof message?.id === 'string' ? message.id.trim() : '';
+    if (!id) return;
+
+    const controller = this._proxySseControllers.get(id);
+    if (!controller) return;
+
+    try {
+      controller.abort();
+    } catch {
+      // noop
+    }
+    this._proxySseControllers.delete(id);
+  }
+
+  private _handleProxySseSubscribe(message: ProxySseSubscribeMessage) {
+    const id = typeof message?.id === 'string' ? message.id.trim() : '';
+    if (!id) return;
+
+    const resolved = this._resolveProxyTarget(message?.url);
+    if (!resolved.targetUrl) {
+      this._postProxySseError(id, resolved.error || 'Invalid proxy SSE target.');
+      this._postProxySseClosed(id);
+      return;
+    }
+
+    const fetchImpl = (globalThis as any)?.fetch as undefined | ((...args: any[]) => Promise<any>);
+    if (typeof fetchImpl !== 'function') {
+      this._postProxySseError(id, 'Host fetch() is not available.');
+      this._postProxySseClosed(id);
+      return;
+    }
+
+    const existing = this._proxySseControllers.get(id);
+    if (existing) {
+      try {
+        existing.abort();
+      } catch {
+        // noop
+      }
+      this._proxySseControllers.delete(id);
+    }
+
+    const controller = new AbortController();
+    this._proxySseControllers.set(id, controller);
+
+    void (async () => {
+      try {
+        const headers = {
+          Accept: 'text/event-stream',
+          ...(this._normalizeProxyHeaders(message.headers) || {}),
+        };
+
+        const res = await fetchImpl(resolved.targetUrl!.toString(), {
+          method: 'GET',
+          headers,
+          signal: controller.signal,
+        });
+
+        if (!res?.ok) {
+          const status = typeof res?.status === 'number' ? ` (${res.status})` : '';
+          this._postProxySseError(id, `SSE subscription failed${status}.`);
+          return;
+        }
+
+        if (!res.body || typeof res.body.getReader !== 'function') {
+          this._postProxySseError(id, 'SSE stream body is unavailable.');
+          return;
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          if (controller.signal.aborted) break;
+
+          buffer += decoder.decode(chunk.value, { stream: true });
+          buffer = buffer.replace(/\r\n/g, '\n');
+
+          const events = buffer.split('\n\n');
+          buffer = events.pop() || '';
+          for (const rawEvent of events) {
+            this._emitProxySseEvent(id, rawEvent);
+          }
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          this._postProxySseError(id, error instanceof Error ? error.message : String(error));
+        }
+      } finally {
+        if (this._proxySseControllers.get(id) === controller) {
+          this._proxySseControllers.delete(id);
+        }
+        this._postProxySseClosed(id);
+      }
+    })();
   }
 
   private _getSessionStateKey(): string {
@@ -310,6 +754,9 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     this._isLoadingHistory = true;
     try {
       const messages = await this._client.getSessionMessages(sid);
+      if (!this._isConnected) return;
+      if (sid !== this._currentSessionId) return;
+
       this._view.webview.postMessage({
         type: 'setHistory',
         sessionId: sid,
@@ -366,7 +813,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   }
 
   private _loadConnectionHistory() {
-    // Load from extension state or default
+    // Seed quick-pick with common local endpoints when no persisted history exists.
     this._connectionHistory = [
       { url: 'http://127.0.0.1:4096', lastConnected: Date.now() },
       { url: 'http://localhost:4096', lastConnected: Date.now() - 86400000 },
@@ -394,11 +841,13 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     // Handle messages from the webview
     webviewView.webview.onDidReceiveMessage(async (data) => {
       switch (data.type) {
+        case 'webviewReady':
+          await this._handleWebviewReady();
+          break;
         case 'sendMessage':
           if (!this._isConnected) {
-            this._view?.webview.postMessage({
-              type: 'error',
-              message: 'Not connected to OpenCode server. Please check connection.'
+            this._postConnectionStatus('disconnected', {
+              error: 'Not connected to OpenCode server. Please check connection.',
             });
             return;
           }
@@ -474,9 +923,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
           break;
         case 'sendCommand':
           if (!this._isConnected) {
-            this._view?.webview.postMessage({
-              type: 'error',
-              message: 'Not connected to OpenCode server. Please check connection.'
+            this._postConnectionStatus('disconnected', {
+              error: 'Not connected to OpenCode server. Please check connection.',
             });
             return;
           }
@@ -542,11 +990,32 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
             void vscode.window.showInformationMessage('Context window usage is not available yet. Send a message first.');
           }
           break;
+        case 'proxyFetch':
+          await this._handleProxyFetch(data as ProxyFetchRequestMessage);
+          break;
+        case 'proxyFetchAbort':
+          if (typeof (data as any)?.id === 'string') {
+            const id = String((data as ProxyFetchAbortMessage).id).trim();
+            const controller = this._proxyFetchControllers.get(id);
+            if (controller) {
+              try {
+                controller.abort();
+              } catch {
+                // noop
+              }
+              this._proxyFetchControllers.delete(id);
+            }
+          }
+          break;
+        case 'proxySseSubscribe':
+          this._handleProxySseSubscribe(data as ProxySseSubscribeMessage);
+          break;
+        case 'proxySseClose':
+          this._handleProxySseClose(data as ProxySseCloseMessage);
+          break;
       }
     });
 
-    // Initial health check
-    this._handleHealthCheck();
   }
 
   public sendMessage(text: string) {
@@ -564,6 +1033,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   }
 
   private async _handleConnectToUrl(url: string) {
+    this._abortAllProxyTransports();
+
     this._currentUrl = url;
     this._client = new OpenCodeClient(url, { directory: this._workspaceDirectory });
     this._currentSessionId = undefined;
@@ -598,6 +1069,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private async _handleGetSessions() {
     try {
       const sessions = await this._client.listSessions({ limit: this._sessionsListLimit });
+      if (!this._isConnected) return;
+
       const list = (sessions || [])
         .filter((s) => s && typeof (s as any).id === 'string')
         .sort((a, b) => {
@@ -622,6 +1095,8 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
         limit: this._sessionsListLimit,
       });
     } catch (error) {
+      if (!this._isConnected) return;
+
       const msg = error instanceof Error ? error.message : String(error);
       console.warn('[OpenCode] Failed to list sessions:', msg);
       this._view?.webview.postMessage({
@@ -924,9 +1399,13 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       const binHint = process.platform === 'darwin'
         ? path.join(os.homedir(), '.opencode', 'bin', 'opencode')
         : undefined;
-      const handle = await this._client.startServer({ hostname: '127.0.0.1', port: 4096, timeout: 10000, logLevel: 'info', binaryPath: binHint });
-      this._serverHandle = handle;
-      this._isServerStartedByExtension = true;
+      const handle = await this._client.startServerWithRuntime(this._connectionRuntime, {
+        hostname: '127.0.0.1',
+        port: 4096,
+        timeout: 10000,
+        logLevel: 'info',
+        binaryPath: binHint,
+      });
       await this._handleConnectToUrl(handle.url);
       vscode.window.showInformationMessage(`Started OpenCode server at ${handle.url}`);
     } catch (error) {
@@ -948,23 +1427,52 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    try {
-      this._serverHandle.close();
-    } catch {
-      // noop
-    }
-    this._serverHandle = undefined;
-    this._isServerStartedByExtension = false;
-    this._stopEventStream();
-    this._isConnected = false;
-    this._view?.webview.postMessage({
-      type: 'healthStatus',
-      status: 'disconnected',
-      url: this._currentUrl,
-      isConnected: false
-    });
+    this._client.stopServerWithRuntime(this._connectionRuntime);
+    this._clearSessionStateAfterServerShutdown();
 
     vscode.window.showInformationMessage('Stopped OpenCode server.');
+  }
+
+  private _clearSessionStateAfterServerShutdown() {
+    this._abortAllProxyTransports();
+    this._endStreamingUI('server shutdown');
+    this._stopEventStream();
+
+    if (this._historyReloadTimer) {
+      clearTimeout(this._historyReloadTimer);
+      this._historyReloadTimer = undefined;
+    }
+    if (this._sessionsReloadTimer) {
+      clearTimeout(this._sessionsReloadTimer);
+      this._sessionsReloadTimer = undefined;
+    }
+
+    this._isLoadingHistory = false;
+    this._pendingHistorySessionId = undefined;
+    this._hasRenderedInitialHistory = false;
+    this._lastHistorySessionId = undefined;
+    this._currentSessionId = undefined;
+    this._activeAssistantMessageId = undefined;
+    this._titleRenameInFlightSessions.clear();
+    this._titleRenamePendingSessions.clear();
+
+    this._lastContextUsedTokens = undefined;
+    this._lastContextMaxTokens = undefined;
+    this._postConnectionStatus('disconnected');
+    this._view?.webview.postMessage({
+      type: 'sessionsList',
+      sessions: [],
+      currentSessionId: '',
+      limit: this._sessionsListLimit,
+    });
+    this._view?.webview.postMessage({
+      type: 'setHistory',
+      sessionId: '',
+      messages: [],
+    });
+    this._view?.webview.postMessage({ type: 'contextUpdate', usedTokens: 0, maxTokens: 1 });
+    this._postWebviewInitPayload();
+    void this._persistSessionState();
   }
 
   private _stopEventStream() {
@@ -1201,6 +1709,14 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       if (this._eventAbortController === controller) {
         this._eventAbortController = undefined;
       }
+
+      if (!controller.signal.aborted) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this._postConnectionStatus('reconnecting', {
+          error: msg ? `Event stream interrupted: ${msg}` : 'Event stream interrupted. Retrying connection.',
+        });
+        void this._handleHealthCheck();
+      }
     });
   }
 
@@ -1213,7 +1729,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
     
     const selected = await vscode.window.showQuickPick(
       [
-        { label: '$(server) Start local server (127.0.0.1:4096)', description: 'Start opencode serve and connect', url: 'start-local' },
+        { label: '$(server) Start local server', description: 'Start opencode serve and connect', url: 'start-local' },
         ...items,
         { label: '$(add) Add new server...', url: 'new' }
       ],
@@ -1231,7 +1747,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       if (selected.url === 'new') {
         const input = await vscode.window.showInputBox({
           prompt: 'Enter OpenCode server URL or port (e.g., http://localhost:4096 or just 4096)',
-          placeHolder: 'http://127.0.0.1:4096',
+          placeHolder: this._currentUrl || 'http://127.0.0.1:4096',
           value: this._currentUrl,
           validateInput: (value) => {
             if (!value) {
@@ -1533,16 +2049,20 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
 
   private async _handleHealthCheck(showError: boolean = false) {
     try {
+      const wasConnected = this._isConnected;
+      if (wasConnected) {
+        this._postConnectionStatus('reconnecting');
+      }
+
       console.log(`[OpenCode] Checking health at ${this._currentUrl}`);
       const health = await this._client.health();
       console.log(`[OpenCode] Health check result:`, health);
-      this._isConnected = health.healthy === true;
-      this._view?.webview.postMessage({
-        type: 'healthStatus',
-        status: health.healthy ? 'ok' : 'error',
-        url: this._currentUrl,
-        isConnected: this._isConnected
-      });
+      const isHealthy = health.healthy === true;
+      if (isHealthy) {
+        this._postConnectionStatus('connected');
+      } else {
+        this._postConnectionStatus('disconnected');
+      }
       
       if (this._isConnected) {
         this._ensureEventStream();
@@ -1570,22 +2090,16 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
       }
     } catch (error) {
       console.error(`[OpenCode] Health check failed:`, error);
-      this._isConnected = false;
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      this._postConnectionStatus('failed', { error: errorMessage });
       this._stopEventStream();
       this._lastContextUsedTokens = undefined;
       this._lastContextMaxTokens = undefined;
-      this._view?.webview.postMessage({
-        type: 'healthStatus',
-        status: 'disconnected',
-        url: this._currentUrl,
-        isConnected: false
-      });
 
       this._view?.webview.postMessage({ type: 'contextUpdate', usedTokens: 0, maxTokens: 1 });
       
       // Show error notification if this was a manual connection attempt
       if (showError) {
-        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
         vscode.window.showErrorMessage(
           `Failed to connect to ${this._currentUrl}: ${errorMessage}`,
           'Retry',
@@ -1598,7 +2112,13 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
           }
         });
       }
+    } finally {
+      this._postWebviewInitPayload();
     }
+  }
+
+  private async _handleWebviewReady() {
+    await this._handleHealthCheck();
   }
 
   private async _handleGetModels() {

@@ -290,8 +290,24 @@ body {
   background-color: var(--vscode-testing-iconFailed);
 }
 
+#connection-bar.reconnecting .status-dot {
+  background-color: var(--vscode-editorWarning-foreground);
+}
+
+#connection-bar.failed .status-dot {
+  background-color: var(--vscode-testing-iconFailed);
+}
+
 #connection-bar.connected .status-text {
   color: var(--vscode-foreground);
+}
+
+#connection-bar.reconnecting .status-text {
+  color: var(--vscode-editorWarning-foreground);
+}
+
+#connection-bar.failed .status-text {
+  color: var(--vscode-testing-iconFailed);
 }
 
 /* Messages Container */

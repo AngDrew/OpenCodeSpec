@@ -5,8 +5,7 @@ import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-
-const OPENCODE_BASE_URL = 'http://127.0.0.1:4096';
+import type { OpenCodeConnectionRuntime, OpenCodeServerHandle } from '../connection/connectionRuntime';
 
 export interface Session {
   id: string;
@@ -91,6 +90,15 @@ export interface PromptRequest {
   };
 }
 
+export interface StartServerOptions {
+  hostname?: string;
+  port?: number;
+  timeout?: number;
+  logLevel?: string;
+  /** Optional absolute path to `opencode` binary. */
+  binaryPath?: string;
+}
+
 export interface CommandRequest {
   command: string;
   arguments: string;
@@ -106,8 +114,8 @@ export class OpenCodeClient {
   private directory?: string;
   private _sdkClientPromise?: Promise<any>;
 
-  constructor(baseUrl: string = OPENCODE_BASE_URL, opts?: { directory?: string }) {
-    this.baseUrl = baseUrl;
+  constructor(baseUrl: string, opts?: { directory?: string }) {
+    this.baseUrl = typeof baseUrl === 'string' ? baseUrl.trim() : '';
     this.directory = opts?.directory;
   }
 
@@ -134,14 +142,7 @@ export class OpenCodeClient {
     return this._sdkClientPromise;
   }
 
-  async startServer(opts?: {
-    hostname?: string;
-    port?: number;
-    timeout?: number;
-    logLevel?: string;
-    /** Optional absolute path to `opencode` binary. */
-    binaryPath?: string;
-  }): Promise<{ url: string; close: () => void }> {
+  async startServer(opts?: StartServerOptions): Promise<OpenCodeServerHandle> {
     const normalizeLogLevel = (value: unknown): string | undefined => {
       if (typeof value !== 'string') return undefined;
       const v = value.trim();
@@ -167,7 +168,7 @@ export class OpenCodeClient {
 
     try {
       const mod = await import('@opencode-ai/sdk/v2/server');
-      const createOpencodeServer = mod.createOpencodeServer as (o: any) => Promise<{ url: string; close: () => void }>;
+      const createOpencodeServer = mod.createOpencodeServer as (o: any) => Promise<OpenCodeServerHandle>;
       return await createOpencodeServer(options);
     } catch (err) {
       if (!isSpawnNotFound(err)) {
@@ -469,6 +470,30 @@ export class OpenCodeClient {
     }
 
     throw (lastErr instanceof Error ? lastErr : new Error('Failed to create session'));
+  }
+
+  async startServerWithRuntime(runtime: OpenCodeConnectionRuntime, opts?: StartServerOptions): Promise<OpenCodeServerHandle> {
+    const handle = await this.startServer(opts);
+    runtime.setServerHandle(handle);
+    runtime.setCurrentServerUrl(handle.url);
+    return handle;
+  }
+
+  stopServerWithRuntime(runtime: OpenCodeConnectionRuntime): boolean {
+    const handle = runtime.serverHandle;
+    if (!handle) {
+      return false;
+    }
+
+    try {
+      handle.close();
+    } catch {
+      // noop
+    }
+
+    runtime.setServerHandle(undefined);
+    runtime.setReady(false);
+    return true;
   }
 
   async deleteSession(sessionId: string): Promise<void> {

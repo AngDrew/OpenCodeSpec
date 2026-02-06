@@ -44,7 +44,9 @@
   const DEFAULT_VARIANT_ID = '__default__';
   let currentVariant = DEFAULT_VARIANT_ID;
   let currentSessionId = '';
-  let currentUrl = 'http://127.0.0.1:4096';
+  let streamingSessionId = '';
+  // Populated by host `healthStatus`/`initState`; no fixed server URL assumption.
+  let currentUrl = '';
   let availableAgents = [];
   let availableModels = [];
   let availableVariants = [];
@@ -57,6 +59,462 @@
   let thinkingByMessageId = new Map();
   let toolRowsByMessageId = new Map();
   let patchRowsByMessageId = new Map();
+
+  function createRealtimeSyncState() {
+    return {
+      sessions: {
+        byId: new Map(),
+        order: [],
+      },
+      messages: {
+        byId: new Map(),
+        orderBySessionId: new Map(),
+        partsByMessageId: new Map(),
+      },
+      permissions: {
+        bySessionId: new Map(),
+      },
+      status: {
+        connection: {
+          value: 'disconnected',
+          url: currentUrl,
+          error: '',
+        },
+        sessionById: new Map(),
+      },
+    };
+  }
+
+  // Ordering assumptions for normalized realtime sync state:
+  // 1) `setHistory` is the canonical baseline for a session and replaces prior
+  //    message/part state for that session.
+  // 2) `partUpdate` may arrive before/after `setHistory`; updates are merged by
+  //    stable message and part keys using last-write-wins semantics.
+  // 3) text/reasoning parts append when `delta` exists; otherwise snapshots
+  //    replace the current text for that part key.
+  // 4) session/permission/status updates are idempotent by stable IDs and are
+  //    safe to replay without creating duplicates.
+  // 5) high-frequency realtime events are processed in FIFO batches per frame,
+  //    preserving event order while minimizing render thrash.
+  let realtimeSyncState = createRealtimeSyncState();
+
+  function resetRenderedMessageState() {
+    messageElsById = new Map();
+    textByMessageId = new Map();
+    thinkingByMessageId = new Map();
+    toolRowsByMessageId = new Map();
+    patchRowsByMessageId = new Map();
+  }
+
+  function clearMessageSyncState(sessionID) {
+    const sid = typeof sessionID === 'string' ? sessionID.trim() : '';
+    if (!sid) {
+      realtimeSyncState.messages.byId.clear();
+      realtimeSyncState.messages.orderBySessionId.clear();
+      realtimeSyncState.messages.partsByMessageId.clear();
+      return;
+    }
+
+    const order = realtimeSyncState.messages.orderBySessionId.get(sid) || [];
+    order.forEach((messageID) => {
+      realtimeSyncState.messages.byId.delete(messageID);
+      realtimeSyncState.messages.partsByMessageId.delete(messageID);
+    });
+    realtimeSyncState.messages.orderBySessionId.set(sid, []);
+  }
+
+  function ensureMessageOrder(sessionID, messageID) {
+    if (!sessionID || !messageID) return;
+    if (!realtimeSyncState.messages.orderBySessionId.has(sessionID)) {
+      realtimeSyncState.messages.orderBySessionId.set(sessionID, []);
+    }
+    const order = realtimeSyncState.messages.orderBySessionId.get(sessionID);
+    if (!order.includes(messageID)) {
+      order.push(messageID);
+    }
+  }
+
+  function ensureMessageRecord(messageID, part, roleFallback, sessionIDFallback) {
+    const id = typeof messageID === 'string' ? messageID.trim() : '';
+    if (!id) return null;
+
+    const partSessionID = part && typeof part.sessionID === 'string' ? part.sessionID.trim() : '';
+    const sessionID = partSessionID || sessionIDFallback || currentSessionId || '';
+    const role = (part && part.message && part.message.role) || (part && part.role) || roleFallback || 'assistant';
+
+    let record = realtimeSyncState.messages.byId.get(id);
+    if (!record) {
+      record = {
+        id,
+        sessionID,
+        role,
+      };
+      realtimeSyncState.messages.byId.set(id, record);
+    } else {
+      if (!record.sessionID && sessionID) record.sessionID = sessionID;
+      if (!record.role && role) record.role = role;
+    }
+
+    if (record.sessionID) {
+      ensureMessageOrder(record.sessionID, id);
+    }
+
+    return record;
+  }
+
+  function ensurePartsMap(messageID) {
+    if (!realtimeSyncState.messages.partsByMessageId.has(messageID)) {
+      realtimeSyncState.messages.partsByMessageId.set(messageID, new Map());
+    }
+    return realtimeSyncState.messages.partsByMessageId.get(messageID);
+  }
+
+  function getPartSyncKey(part, indexHint) {
+    if (!part || typeof part !== 'object') return `unknown:${indexHint}`;
+    if (typeof part.id === 'string' && part.id.trim().length > 0) {
+      return `id:${part.id.trim()}`;
+    }
+
+    const partType = typeof part.type === 'string' ? part.type : 'unknown';
+    if (partType === 'tool' && typeof part.callID === 'string' && part.callID.trim().length > 0) {
+      return `tool:${part.callID.trim()}`;
+    }
+    if (partType === 'patch' && typeof part.hash === 'string' && part.hash.trim().length > 0) {
+      return `patch:${part.hash.trim()}`;
+    }
+    if (partType === 'text' || partType === 'reasoning' || partType === 'step-start' || partType === 'step-finish') {
+      return partType;
+    }
+    return `${partType}:${indexHint}`;
+  }
+
+  function upsertPartSyncState(messageID, part, delta, indexHint, sessionIDFallback) {
+    const messageRecord = ensureMessageRecord(messageID, part, undefined, sessionIDFallback);
+    if (!messageRecord || !part) return messageRecord;
+
+    const parts = ensurePartsMap(messageRecord.id);
+    const key = getPartSyncKey(part, indexHint);
+    const previousPart = parts.get(key);
+    const nextPart = {
+      ...part,
+      key,
+      messageID: messageRecord.id,
+      sessionID: messageRecord.sessionID,
+    };
+
+    if (part.type === 'text' || part.type === 'reasoning') {
+      const previousText = previousPart && typeof previousPart.text === 'string' ? previousPart.text : '';
+      if (typeof delta === 'string' && delta.length > 0) {
+        nextPart.text = previousText + delta;
+      } else if (typeof part.text === 'string') {
+        nextPart.text = part.text;
+      } else {
+        nextPart.text = previousText;
+      }
+    }
+
+    parts.set(key, nextPart);
+    return messageRecord;
+  }
+
+  function composePartText(messageID, partType) {
+    const parts = realtimeSyncState.messages.partsByMessageId.get(messageID);
+    if (!parts) return '';
+
+    let text = '';
+    for (const part of parts.values()) {
+      if (!part || part.type !== partType) continue;
+      if (typeof part.text === 'string' && part.text.length > 0) {
+        text += part.text;
+      }
+    }
+    return text;
+  }
+
+  function applySessionsSyncState(payload) {
+    const sessions = Array.isArray(payload && payload.sessions) ? payload.sessions : [];
+    availableSessions = sessions;
+
+    const byId = new Map();
+    const order = [];
+    sessions.forEach((session) => {
+      const id = session && typeof session.id === 'string' ? session.id.trim() : '';
+      if (!id) return;
+      byId.set(id, session);
+      order.push(id);
+    });
+
+    realtimeSyncState.sessions.byId = byId;
+    realtimeSyncState.sessions.order = order;
+
+    if (payload && typeof payload.currentSessionId === 'string') {
+      const nextSessionID = normalizeSessionID(payload.currentSessionId);
+      if (nextSessionID && nextSessionID !== currentSessionId) {
+        beginBootstrapReconciliation(nextSessionID);
+      }
+      currentSessionId = nextSessionID;
+    }
+  }
+
+  function applyPermissionSyncState(payload) {
+    if (!payload || typeof payload !== 'object') return;
+    const sessionID = typeof payload.sessionId === 'string'
+      ? payload.sessionId.trim()
+      : (typeof payload.sessionID === 'string' ? payload.sessionID.trim() : currentSessionId);
+    if (!sessionID) return;
+
+    const requestID = typeof payload.requestId === 'string'
+      ? payload.requestId.trim()
+      : (typeof payload.requestID === 'string' ? payload.requestID.trim() : 'default');
+    if (!requestID) return;
+
+    if (!realtimeSyncState.permissions.bySessionId.has(sessionID)) {
+      realtimeSyncState.permissions.bySessionId.set(sessionID, new Map());
+    }
+
+    const permissionsForSession = realtimeSyncState.permissions.bySessionId.get(sessionID);
+    permissionsForSession.set(requestID, { ...payload, sessionID, requestID });
+  }
+
+  function clearPermissionSyncState(payload) {
+    if (!payload || typeof payload !== 'object') return;
+    const sessionID = typeof payload.sessionId === 'string'
+      ? payload.sessionId.trim()
+      : (typeof payload.sessionID === 'string' ? payload.sessionID.trim() : currentSessionId);
+    if (!sessionID) return;
+
+    const permissionsForSession = realtimeSyncState.permissions.bySessionId.get(sessionID);
+    if (!permissionsForSession) return;
+
+    const requestID = typeof payload.requestId === 'string'
+      ? payload.requestId.trim()
+      : (typeof payload.requestID === 'string' ? payload.requestID.trim() : '');
+    if (!requestID) {
+      realtimeSyncState.permissions.bySessionId.delete(sessionID);
+      return;
+    }
+
+    permissionsForSession.delete(requestID);
+    if (permissionsForSession.size === 0) {
+      realtimeSyncState.permissions.bySessionId.delete(sessionID);
+    }
+  }
+
+  function applySessionStatusSyncState(payload) {
+    if (!payload || typeof payload !== 'object') return;
+    const sessionID = typeof payload.sessionId === 'string'
+      ? payload.sessionId.trim()
+      : (typeof payload.sessionID === 'string' ? payload.sessionID.trim() : currentSessionId);
+    if (!sessionID) return;
+
+    const status = typeof payload.status === 'string' ? payload.status.trim() : '';
+    if (!status) return;
+
+    realtimeSyncState.status.sessionById.set(sessionID, {
+      status,
+      updatedAt: Date.now(),
+      source: payload.source || 'host',
+    });
+  }
+
+  const BATCHED_REALTIME_MESSAGE_TYPES = new Set([
+    'partUpdate',
+    'permissionUpdate',
+    'permissionClear',
+    'sessionStatus',
+  ]);
+
+  let queuedRealtimeMessages = [];
+  let queuedRealtimeFlushHandle = null;
+  let queuedRealtimeFlushIsRaf = false;
+  let pendingBootstrapSessionId = '';
+  let bootstrapReconciliationReleaseHandle = null;
+
+  function isBatchedRealtimeMessageType(type) {
+    return typeof type === 'string' && BATCHED_REALTIME_MESSAGE_TYPES.has(type);
+  }
+
+  function normalizeSessionID(value) {
+    return typeof value === 'string' ? value.trim() : '';
+  }
+
+  function isRealtimeDrainBlocked() {
+    return pendingBootstrapSessionId.length > 0;
+  }
+
+  function beginBootstrapReconciliation(sessionID) {
+    const sid = normalizeSessionID(sessionID);
+    if (!sid) return;
+
+    pendingBootstrapSessionId = sid;
+    if (bootstrapReconciliationReleaseHandle !== null) {
+      clearTimeout(bootstrapReconciliationReleaseHandle);
+    }
+
+    bootstrapReconciliationReleaseHandle = window.setTimeout(() => {
+      pendingBootstrapSessionId = '';
+      bootstrapReconciliationReleaseHandle = null;
+      flushQueuedRealtimeMessagesNow();
+    }, 3000);
+  }
+
+  function completeBootstrapReconciliation(sessionID) {
+    if (!pendingBootstrapSessionId) return;
+
+    const sid = normalizeSessionID(sessionID);
+    if (sid && sid !== pendingBootstrapSessionId) {
+      return;
+    }
+
+    pendingBootstrapSessionId = '';
+    if (bootstrapReconciliationReleaseHandle !== null) {
+      clearTimeout(bootstrapReconciliationReleaseHandle);
+      bootstrapReconciliationReleaseHandle = null;
+    }
+
+    if (messageType !== 'setHistory') {
+      flushQueuedRealtimeMessagesNow();
+    }
+  }
+
+  function withSessionFallback(payload, sessionIDFallback) {
+    if (!payload || typeof payload !== 'object') return payload;
+    if (typeof payload.sessionId === 'string' || typeof payload.sessionID === 'string') {
+      return payload;
+    }
+    return {
+      ...payload,
+      sessionID: sessionIDFallback,
+    };
+  }
+
+  function scheduleQueuedRealtimeFlush() {
+    if (queuedRealtimeFlushHandle !== null) return;
+    if (isRealtimeDrainBlocked()) return;
+
+    const flush = () => {
+      queuedRealtimeFlushHandle = null;
+      queuedRealtimeFlushIsRaf = false;
+      flushQueuedRealtimeMessages();
+    };
+
+    if (typeof window.requestAnimationFrame === 'function') {
+      queuedRealtimeFlushIsRaf = true;
+      queuedRealtimeFlushHandle = window.requestAnimationFrame(flush);
+      return;
+    }
+
+    queuedRealtimeFlushIsRaf = false;
+    queuedRealtimeFlushHandle = window.setTimeout(flush, 16);
+  }
+
+  function applyBatchedRealtimeMessage(queuedEntry) {
+    const message = queuedEntry && queuedEntry.message ? queuedEntry.message : queuedEntry;
+    if (!message || typeof message !== 'object') return false;
+
+    const fallbackSessionID = queuedEntry && typeof queuedEntry.sessionIDFallback === 'string'
+      ? queuedEntry.sessionIDFallback
+      : currentSessionId;
+
+    switch (message.type) {
+      case 'partUpdate':
+        applyPartUpdate(message.messageID, message.part, message.delta, fallbackSessionID, 0);
+        return true;
+
+      case 'permissionUpdate':
+        applyPermissionSyncState(withSessionFallback(message, fallbackSessionID));
+        return false;
+
+      case 'permissionClear':
+        clearPermissionSyncState(withSessionFallback(message, fallbackSessionID));
+        return false;
+
+      case 'sessionStatus':
+        applySessionStatusSyncState(withSessionFallback(message, fallbackSessionID));
+        return false;
+
+      default:
+        return false;
+    }
+  }
+
+  function flushQueuedRealtimeMessages() {
+    if (queuedRealtimeMessages.length === 0) return;
+    if (isRealtimeDrainBlocked()) return;
+
+    const batch = queuedRealtimeMessages;
+    queuedRealtimeMessages = [];
+
+    let shouldScroll = false;
+    const hasPartUpdate = batch.some((entry) => entry && entry.message && entry.message.type === 'partUpdate');
+    if (hasPartUpdate) {
+      hideWelcome();
+    }
+
+    for (const entry of batch) {
+      if (applyBatchedRealtimeMessage(entry)) {
+        shouldScroll = true;
+      }
+    }
+
+    if (shouldScroll) {
+      scrollToBottom();
+    }
+  }
+
+  function flushQueuedRealtimeMessagesNow() {
+    if (queuedRealtimeFlushHandle !== null) {
+      if (queuedRealtimeFlushIsRaf && typeof window.cancelAnimationFrame === 'function') {
+        window.cancelAnimationFrame(queuedRealtimeFlushHandle);
+      } else {
+        clearTimeout(queuedRealtimeFlushHandle);
+      }
+      queuedRealtimeFlushHandle = null;
+      queuedRealtimeFlushIsRaf = false;
+    }
+
+    flushQueuedRealtimeMessages();
+  }
+
+  function clearQueuedRealtimeMessages() {
+    if (queuedRealtimeFlushHandle !== null) {
+      if (queuedRealtimeFlushIsRaf && typeof window.cancelAnimationFrame === 'function') {
+        window.cancelAnimationFrame(queuedRealtimeFlushHandle);
+      } else {
+        clearTimeout(queuedRealtimeFlushHandle);
+      }
+    }
+    queuedRealtimeFlushHandle = null;
+    queuedRealtimeFlushIsRaf = false;
+    queuedRealtimeMessages = [];
+  }
+
+  function clearInFlightGenerationState(options) {
+    const clearRealtimeQueue = Boolean(options && options.clearRealtimeQueue);
+    if (clearRealtimeQueue) {
+      clearQueuedRealtimeMessages();
+    }
+
+    isStreaming = false;
+    streamingSessionId = '';
+    currentStreamingElement = null;
+    currentStreamingRoot = null;
+    streamingText = '';
+    thinkingText = '';
+    toolRowsByCallId = new Map();
+    patchRowsByHash = new Map();
+    updateSendButtonState();
+  }
+
+  function enqueueRealtimeMessage(message) {
+    if (!message || typeof message !== 'object') return;
+
+    queuedRealtimeMessages.push({
+      message,
+      sessionIDFallback: currentSessionId,
+    });
+    scheduleQueuedRealtimeFlush();
+  }
 
   // Slash command palette state
   let allCommands = [];
@@ -78,8 +536,8 @@
     updatePaletteBottomOffset();
     updateVariantLabel();
     
-    // Request initial health check
-    vscode.postMessage({ type: 'healthCheck' });
+    // Notify host that the webview is ready for canonical init payload.
+    vscode.postMessage({ type: 'webviewReady' });
   }
 
   function updatePaletteBottomOffset() {
@@ -706,6 +1164,10 @@
       updateVariantLabel();
       vscode.postMessage({ type: 'variantChanged', variant: currentVariant === DEFAULT_VARIANT_ID ? '' : currentVariant });
     } else if (pickerKind === 'session') {
+      if (typeof it.id === 'string' && it.id !== currentSessionId) {
+        beginBootstrapReconciliation(it.id);
+        clearInFlightGenerationState({ clearRealtimeQueue: true });
+      }
       currentSessionId = it.id;
       vscode.postMessage({ type: 'changeSession', sessionId: currentSessionId });
     }
@@ -886,27 +1348,57 @@
     }
   }
 
-  function setConnectedState(connected, url) {
-    isConnected = connected;
+  function normalizeConnectionStatus(rawStatus) {
+    if (typeof rawStatus === 'string') {
+      const value = rawStatus.trim().toLowerCase();
+      if (value === 'connected' || value === 'reconnecting' || value === 'disconnected' || value === 'failed') {
+        return value;
+      }
+    }
+    return 'disconnected';
+  }
+
+  function setConnectedState(statusRaw, url, error) {
+    const previousConnected = isConnected;
+    const status = normalizeConnectionStatus(statusRaw);
+
+    isConnected = status === 'connected';
     currentUrl = url || currentUrl;
-    
-    // Update connection bar
-    connectionBar.className = connected ? 'connected' : 'disconnected';
-    
-    // Update status text
+
+    connectionBar.className = status;
+
     const statusText = connectionStatus.querySelector('.status-text');
     if (statusText) {
-      if (connected) {
-        // Extract host:port from URL
-        const urlObj = new URL(currentUrl);
-        statusText.textContent = `connected: ${urlObj.hostname}:${urlObj.port}`;
+      if (status === 'connected') {
+        let endpoint = currentUrl;
+        try {
+          const urlObj = new URL(currentUrl);
+          endpoint = `${urlObj.hostname}:${urlObj.port}`;
+        } catch {
+          // noop
+        }
+        statusText.textContent = `connected: ${endpoint}`;
+      } else if (status === 'reconnecting') {
+        statusText.textContent = 'reconnecting';
+      } else if (status === 'failed') {
+        statusText.textContent = 'failed';
       } else {
         statusText.textContent = 'disconnected';
       }
     }
-    
+
+    const errorText = typeof error === 'string' ? error.trim() : '';
+    realtimeSyncState.status.connection = {
+      value: status,
+      url: currentUrl,
+      error: errorText,
+    };
+    connectionStatus.title = errorText.length > 0
+      ? `${status}: ${errorText}`
+      : status;
+
     // Enable/disable input controls
-    if (connected) {
+    if (isConnected) {
       messageInput.disabled = false;
       if (modePicker) modePicker.disabled = false;
       if (modelPicker) modelPicker.disabled = false;
@@ -914,13 +1406,13 @@
       if (sessionPicker) sessionPicker.disabled = false;
       if (newChatBtn) newChatBtn.disabled = false;
       inputWrapper.classList.remove('disabled');
-      
-      // Request agents and models
-      vscode.postMessage({ type: 'getAgents' });
-      vscode.postMessage({ type: 'getModels' });
-      vscode.postMessage({ type: 'getSessions', limit: sessionsListLimit });
 
-      ensureVariantsForCurrentModel();
+      if (!previousConnected) {
+        vscode.postMessage({ type: 'getAgents' });
+        vscode.postMessage({ type: 'getModels' });
+        vscode.postMessage({ type: 'getSessions', limit: sessionsListLimit });
+        ensureVariantsForCurrentModel();
+      }
     } else {
       messageInput.disabled = true;
       if (modePicker) modePicker.disabled = true;
@@ -1004,20 +1496,14 @@
   function showWelcome() {
     welcomeMessage.style.display = 'block';
     messagesContainer.innerHTML = '';
-    messageElsById = new Map();
-    textByMessageId = new Map();
-    thinkingByMessageId = new Map();
-    toolRowsByMessageId = new Map();
-    patchRowsByMessageId = new Map();
+    resetRenderedMessageState();
+    clearMessageSyncState(currentSessionId);
   }
 
-  function resetHistoryState() {
+  function resetHistoryState(sessionID) {
     messagesContainer.innerHTML = '';
-    messageElsById = new Map();
-    textByMessageId = new Map();
-    thinkingByMessageId = new Map();
-    toolRowsByMessageId = new Map();
-    patchRowsByMessageId = new Map();
+    resetRenderedMessageState();
+    clearMessageSyncState(sessionID);
   }
 
   function getOrCreateMessageEl(messageID, role) {
@@ -1065,10 +1551,13 @@
     }
   }
 
-  function applyPartUpdate(messageID, part, delta) {
+  function applyPartUpdate(messageID, part, delta, sessionIDFallback, indexHint) {
     if (!messageID || !part) return;
-    const role = (part.message && part.message.role) || part.role || 'assistant';
-    const messageEl = getOrCreateMessageEl(messageID, role);
+    const messageRecord = upsertPartSyncState(messageID, part, delta, indexHint, sessionIDFallback);
+    if (!messageRecord) return;
+
+    const role = messageRecord.role || 'assistant';
+    const messageEl = getOrCreateMessageEl(messageRecord.id, role);
     if (!messageEl) return;
 
     if (role === 'assistant') {
@@ -1078,23 +1567,21 @@
 
     const pType = part.type;
     if (pType === 'text') {
-      const prev = textByMessageId.get(messageID) || '';
-      const next = (typeof delta === 'string' && delta.length > 0) ? (prev + delta) : (part.text || prev);
-      textByMessageId.set(messageID, next);
+      const next = composePartText(messageRecord.id, 'text');
+      textByMessageId.set(messageRecord.id, next);
       const contentEl = getContentEl(messageEl);
       if (contentEl) contentEl.innerHTML = formatContent(next);
     }
 
     if (pType === 'reasoning') {
-      const prev = thinkingByMessageId.get(messageID) || '';
-      const next = (typeof delta === 'string' && delta.length > 0) ? (prev + delta) : (part.text || prev);
-      thinkingByMessageId.set(messageID, next);
+      const next = composePartText(messageRecord.id, 'reasoning');
+      thinkingByMessageId.set(messageRecord.id, next);
       const body = ensureThinkingBlock(messageEl);
       if (body) body.innerHTML = formatContent(next);
     }
 
     if (pType === 'tool') {
-      updateToolRowForMessage(messageID, messageEl, {
+      updateToolRowForMessage(messageRecord.id, messageEl, {
         tool: part.tool,
         callID: part.callID,
         state: part.state,
@@ -1102,7 +1589,7 @@
     }
 
     if (pType === 'patch') {
-      addPatchRowForMessage(messageID, messageEl, {
+      addPatchRowForMessage(messageRecord.id, messageEl, {
         hash: part.hash,
         files: part.files,
       });
@@ -1342,8 +1829,16 @@
   // Handle messages from extension
   window.addEventListener('message', (event) => {
     const message = event.data;
-    
-    switch (message.type) {
+    const messageType = message && typeof message.type === 'string' ? message.type : '';
+
+    if (isBatchedRealtimeMessageType(messageType)) {
+      enqueueRealtimeMessage(message);
+      return;
+    }
+
+    flushQueuedRealtimeMessagesNow();
+
+    switch (messageType) {
       case 'agentsList':
         if ((!currentMode || currentMode === 'build') && message && typeof message.defaultAgentId === 'string' && message.defaultAgentId.length > 0) {
           currentMode = message.defaultAgentId;
@@ -1394,10 +1889,7 @@
         break;
 
       case 'sessionsList':
-        availableSessions = Array.isArray(message.sessions) ? message.sessions : [];
-        if (message && typeof message.currentSessionId === 'string') {
-          currentSessionId = message.currentSessionId;
-        }
+        applySessionsSyncState(message);
         if (message && typeof message.limit === 'number' && Number.isFinite(message.limit) && message.limit > 0) {
           sessionsListLimit = Math.max(10, Math.min(Math.floor(message.limit), 500));
         }
@@ -1432,6 +1924,7 @@
         
       case 'startStreaming':
         isStreaming = true;
+        streamingSessionId = currentSessionId;
         streamingText = '';
         thinkingText = '';
         toolRowsByCallId = new Map();
@@ -1463,22 +1956,45 @@
         break;
 
       case 'setHistory':
+        const historySessionID = normalizeSessionID(typeof message.sessionId === 'string' ? message.sessionId : currentSessionId);
+        beginBootstrapReconciliation(historySessionID);
+        const shouldClearInFlightForSessionSwitch = isStreaming
+          && historySessionID
+          && streamingSessionId
+          && historySessionID !== streamingSessionId;
+
+        if (shouldClearInFlightForSessionSwitch) {
+          clearInFlightGenerationState({ clearRealtimeQueue: true });
+        }
+
+        clearPermissionSyncState({
+          sessionID: historySessionID,
+        });
+        applySessionStatusSyncState({
+          sessionID: historySessionID,
+          status: 'history_loaded',
+          source: 'setHistory',
+        });
+
         if ((message.messages || []).length === 0) {
           showWelcome();
         } else {
           hideWelcome();
         }
-        resetHistoryState();
+
+        resetHistoryState(historySessionID);
         (message.messages || []).forEach((entry) => {
           const info = entry?.info || {};
           const msgId = info.id || info.messageID;
+          const sessionID = info.sessionID || historySessionID;
           const role = info.role || 'assistant';
           if (!msgId) return;
+          ensureMessageRecord(msgId, { sessionID, role }, role, historySessionID);
           const messageEl = getOrCreateMessageEl(msgId, role);
           if (!messageEl) return;
           const parts = Array.isArray(entry.parts) ? entry.parts : [];
-          parts.forEach((p) => {
-            applyPartUpdate(msgId, p, undefined);
+          parts.forEach((p, index) => {
+            applyPartUpdate(msgId, p, undefined, historySessionID, index);
           });
         });
 
@@ -1496,6 +2012,7 @@
           }
         }
         scrollToBottom();
+        completeBootstrapReconciliation(historySessionID);
         break;
 
       case 'sessionCreated':
@@ -1508,9 +2025,10 @@
         break;
 
       case 'partUpdate':
-        hideWelcome();
-        applyPartUpdate(message.messageID, message.part, message.delta);
-        scrollToBottom();
+      case 'permissionUpdate':
+      case 'permissionClear':
+      case 'sessionStatus':
+        // Handled by batched realtime queue above.
         break;
         
       case 'streamChunk':
@@ -1587,20 +2105,45 @@
         break;
         
       case 'endStreaming':
-        isStreaming = false;
-        currentStreamingElement = null;
-        currentStreamingRoot = null;
-        updateSendButtonState();
+        clearInFlightGenerationState();
         break;
-        
+
       case 'error':
-        isStreaming = false;
-        updateSendButtonState();
+        clearInFlightGenerationState();
         addMessage('system', `Error: ${message.message}`);
         break;
         
       case 'healthStatus':
-        setConnectedState(message.isConnected, message.url);
+        applySessionStatusSyncState({
+          sessionID: currentSessionId,
+          status: message.status,
+          source: 'healthStatus',
+        });
+        setConnectedState(message.status, message.url, message.error);
+        break;
+
+      case 'initState':
+        if (message && message.payload && typeof message.payload === 'object') {
+          const payload = message.payload;
+          const ctx = payload.sessionContext && typeof payload.sessionContext === 'object'
+            ? payload.sessionContext
+            : undefined;
+          if (ctx && typeof ctx.sessionId === 'string') {
+            const nextSessionID = normalizeSessionID(ctx.sessionId);
+            if (nextSessionID && nextSessionID !== currentSessionId) {
+              beginBootstrapReconciliation(nextSessionID);
+            }
+            currentSessionId = nextSessionID;
+          }
+        }
+        if (message && message.payload && typeof message.payload.ready === 'boolean') {
+          const payload = message.payload;
+          setConnectedState(
+            payload.ready ? 'connected' : 'disconnected',
+            typeof payload.serverUrl === 'string' ? payload.serverUrl : currentUrl,
+            '',
+          );
+        }
         break;
         
       case 'externalMessage':
