@@ -9,7 +9,7 @@ This file is for agentic coding agents working inside `D:\projects\js\OpenCodeSp
 
 ## Repo Map
 
-- read as needed `research/`. to improve your knowledge! check the `research/AGENTS.md` it contains knowledge indexes. dont read everything, just read necessarily
+- read as needed! `research/`. to improve your knowledge! check the `research/AGENTS.md` it contains knowledge indexes. dont read everything, just read necessarily
   - when you might want to do a research (read `## How to Research`)
 - `src/` extension source (TypeScript) + webview assets
 - `src/webview/` shipped webview JS/CSS (plain JS/CSS; not TypeScript)
@@ -61,15 +61,18 @@ When adding new connection features, preserve this architecture: host-managed li
   
 ## How to Research
 
+**Important Notes** Make sure research/.md file size at max 200 lines each. to prevent confussion!
+After research make .md files in research/ folder, then pour your research there, then update the research/AGENTS.md
+
 - using skills: `librarian` skill: delegate `explore` agent to use, dont use librarian skill directly. it will bloating our precious resource
-- using MCP tools: 
+- using tools: 
   - internal repository:
-	- delegate `explore` agent to explore our codes. you may delegate multiple `explore` agents like as much as you want. go wild! explore everything want to know! be curious! be hungry!
+    - delegate `explore` agent to explore our codes. you may delegate multiple `explore` agents like as much as you want. go wild! explore everything want to know! be curious! be hungry!
   - external repository: 
     - you might want to choose one of them: `context7` or `grep_app` or `opensrc`
-      - context7: Get the latest documentation and code. pulls up-to-date, version-specific documentation and code examples straight from the source
-	  - grep_app: Effortlessly search for code, files, and paths across a million GitHub repositories
-	  - opensrc: Automates the process of fetching package source code so you can reference it when needed
+      - **context7**: Get the latest documentation and code. pulls up-to-date, version-specific documentation and code examples straight from the source
+      - **grep_app**: Effortlessly search for code, files, and paths across a million GitHub repositories
+      - **opensrc**: Automates the process of fetching package source code so you can reference it when needed
 
 ### Research Template
 
@@ -82,6 +85,7 @@ When adding new connection features, preserve this architecture: host-managed li
 > ## Rules
 > 
 > - always update this when you add new md file in this research folder.
+> - make sure .md file size at max 200 lines each. to prevent confussion
 
 ## Setup
 

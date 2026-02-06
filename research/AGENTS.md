@@ -8,3 +8,4 @@
 ## Rules
 
 - always update this when you add new md file in this research folder.
+- make sure .md file size at max 200 lines each. to prevent confussion!
